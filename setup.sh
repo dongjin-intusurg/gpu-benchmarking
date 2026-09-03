@@ -17,7 +17,7 @@ ok(){ printf "  ${G}ok${Z}    %s\n" "$1"; }
 warn(){ printf "  ${Y}warn${Z}  %s\n" "$1"; WARN=$((WARN+1)); }
 bad(){ printf "  ${R}FAIL${Z}  %s\n" "$1"; FAIL=$((FAIL+1)); }
 WARN=0; FAIL=0
-SEARCH=()
+SEARCH=(); note_collide=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -87,15 +87,35 @@ export ENGINE_ROOT="${ENGINE_ROOT:-$KIT/engines}"
 mkdir -p "$ENGINE_ROOT"
 n=0
 while IFS= read -r d; do
-  case "$(basename "$d")" in engines_*) ;; *) continue;; esac
-  [ -L "$ENGINE_ROOT/$(basename "$d")" ] && [ "$(readlink -f "$ENGINE_ROOT/$(basename "$d")")" = "$(readlink -f "$d")" ] && continue
+  base="$(basename "$d")"
+  case "$base" in engines_*) ;; *) continue;; esac
   case "$(readlink -f "$d")" in "$(readlink -f "$ENGINE_ROOT")"*) continue;; esac
-  ln -sfn "$d" "$ENGINE_ROOT/$(basename "$d")"; n=$((n+1))
+  # Two model trees can carry the same directory name (engines_fp8 under each of
+  # several model workspaces). A bare `ln -sfn` overwrites the first silently and
+  # a whole family disappears, so a name already taken by a DIFFERENT target gets
+  # qualified with its parent directory instead of clobbering.
+  link="$base"
+  if [ -e "$ENGINE_ROOT/$link" ] || [ -L "$ENGINE_ROOT/$link" ]; then
+    if [ "$(readlink -f "$ENGINE_ROOT/$link")" = "$(readlink -f "$d")" ]; then continue; fi
+    link="$(basename "$(dirname "$d")")_$base"
+    if [ -e "$ENGINE_ROOT/$link" ] || [ -L "$ENGINE_ROOT/$link" ]; then
+      if [ "$(readlink -f "$ENGINE_ROOT/$link")" = "$(readlink -f "$d")" ]; then continue; fi
+      warn "engine dir name taken twice: $d -> $link already points elsewhere; link it by hand"
+      continue
+    fi
+    note_collide="$note_collide $base"
+  fi
+  ln -sfn "$d" "$ENGINE_ROOT/$link"; n=$((n+1))
 done < <(for s in "${SEARCH[@]}"; do find "$s" -maxdepth 5 -type d -name 'engines_*' 2>/dev/null; done | sort -u)
 ok "ENGINE_ROOT=$ENGINE_ROOT ($n new link(s))"
+[ -n "${note_collide:-}" ] && warn "name collision(s) qualified with the parent dir:${note_collide}"
 for e in "$ENGINE_ROOT"/*; do
   [ -e "$e" ] || continue
-  printf "        %-34s %s engine(s)\n" "$(basename "$e")" "$(ls "$e"/*.engine 2>/dev/null | wc -l)"
+  # count at any depth: a serving-runtime layout keeps engines in subdirectories,
+  # and a one-level glob reports a populated tree as empty
+  c=$(find -L "$e" -type f \( -name '*.engine' -o -name '*.plan' \) 2>/dev/null | wc -l)
+  printf "        %-34s %s engine(s)%s\n" "$(basename "$e")" "$c" \
+    "$([ "$c" = 0 ] && printf '  <- empty' || true)"
 done
 
 echo
@@ -127,23 +147,36 @@ TRT_FLAGS=""
 [ -n "$TRT_ROOT" ] && [ -d "$TRT_ROOT/lib" ]     && TRT_FLAGS="$TRT_FLAGS -L$TRT_ROOT/lib"
 build(){ # dir src out extra-libs
   local d="$1" src="$2" out="$3"; shift 3
-  [ -f "$d/$src" ] || { warn "$src not present — skipped"; return; }
+  [ -f "$d/$src" ] || { warn "$src not present at $d — skipped"; return; }
   if [ -x "$d/$out" ] && [ "$d/$out" -nt "$d/$src" ]; then ok "$out already built"; return; fi
   ( cd "$d" && g++ -O2 -std=c++17 "$src" $TRT_FLAGS -I"$TRT_INC" -I"$CUDA_INC" -L"$CUDA_LIB" \
       -lnvinfer -lnvinfer_plugin -lcudart -ldl -lpthread "$@" -o "$out" ) 2>/tmp/bld.$$ \
     && ok "$out built" || { bad "$out build failed: $(tail -1 /tmp/bld.$$)"; }
   rm -f /tmp/bld.$$
 }
+# Every helper reports, including the ones that cannot be built. A stage that
+# silently skips a missing source is worse than one that fails: the run looks
+# clean and the binary is absent when a later stage needs it.
 build "$KIT/scripts/model_bench/cpp" row_loop.cpp row_loop
-# the streaming ASR harness, wherever a stage keeps it
-AE=$(find "$KIT/scripts" -name 'asr_e2e.cpp' | head -1)
-[ -n "$AE" ] && build "$(dirname "$AE")" asr_e2e.cpp asr_e2e
-if command -v nvcc >/dev/null && [ -f "$KIT/scripts/device_ceilings/peak_issue_probe.cu" ]; then
+WE=$(find "$KIT/scripts" -name 'asr_e2e.cpp' 2>/dev/null | head -1)
+if [ -n "$WE" ]; then build "$(dirname "$WE")" asr_e2e.cpp asr_e2e
+else warn "asr_e2e.cpp not present — skipped (needed only by the speech rows)"; fi
+PROBE="$KIT/scripts/device_ceilings/peak_issue_probe.cu"
+if [ ! -f "$PROBE" ]; then
+  warn "peak_issue_probe.cu not present — skipped (needed only by the ceilings stage)"
+elif ! command -v nvcc >/dev/null; then
+  warn "peak_issue_probe: nvcc not on PATH — skipped"
+else
   ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
   [ -n "$ARCH" ] || { [ "$PLATFORM" = jetson ] && ARCH=110 || ARCH=120; }
-  ( cd "$KIT/scripts/device_ceilings" && nvcc -O3 -gencode arch=compute_$ARCH,code=sm_$ARCH \
-      peak_issue_probe.cu -o peak_issue_probe ) 2>/dev/null \
-    && ok "peak_issue_probe built (sm_$ARCH)" || warn "peak_issue_probe build skipped"
+  if [ -x "${PROBE%.cu}" ] && [ "${PROBE%.cu}" -nt "$PROBE" ]; then ok "peak_issue_probe already built"
+  else
+    ( cd "$(dirname "$PROBE")" && nvcc -O3 -gencode arch=compute_$ARCH,code=sm_$ARCH \
+        peak_issue_probe.cu -o peak_issue_probe ) 2>/tmp/probe.$$ \
+      && ok "peak_issue_probe built (sm_$ARCH)" \
+      || bad "peak_issue_probe build failed (sm_$ARCH): $(tail -1 /tmp/probe.$$)"
+    rm -f /tmp/probe.$$
+  fi
 fi
 
 echo
@@ -207,13 +240,18 @@ PYEOF
 echo
 echo "=== summary ==="
 printf "  MODEL_ROOT   %s\n  ENGINE_ROOT  %s\n" "$MODEL_ROOT" "$ENGINE_ROOT"
-cat > "$KIT/.setup_env" <<EOF
-# written by setup.sh — source this in later shells:  . ./.setup_env
-export MODEL_ROOT="$MODEL_ROOT"
-export ENGINE_ROOT="$ENGINE_ROOT"
-export ROW_LOOP="$KIT/scripts/model_bench/cpp/row_loop"
-. "$KIT/env.sh"
-EOF
+RL="$KIT/scripts/model_bench/cpp/row_loop"
+{
+  echo "# written by setup.sh — source this in later shells:  . ./.setup_env"
+  echo "export MODEL_ROOT=\"$MODEL_ROOT\""
+  echo "export ENGINE_ROOT=\"$ENGINE_ROOT\""
+  # exporting a path to a binary that was never built hands every downstream
+  # stage a broken command; leave it unset and say why instead
+  if [ -x "$RL" ]; then echo "export ROW_LOOP=\"$RL\""
+  else echo "# ROW_LOOP unset — $RL was not built (see section 5)"; fi
+  echo ". \"$KIT/env.sh\""
+} > "$KIT/.setup_env"
+[ -x "$RL" ] || warn "ROW_LOOP left unset in .setup_env — the co-location stages need it"
 ok "wrote .setup_env — later shells only need:  . ./.setup_env"
 if [ $FAIL -gt 0 ]; then printf "\n  ${R}%d blocking problem(s)${Z}, %d warning(s)\n" $FAIL $WARN; exit 1; fi
 printf "\n  ${G}ready${Z} — %d warning(s). Next: run the device ceilings\n" $WARN

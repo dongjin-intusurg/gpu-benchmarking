@@ -18,7 +18,8 @@ gpu-benchmarking/
   configs/            mix and manifest templates             (available; device constants pending)
   ADDING_A_MODEL.md   how to describe a new model            (available)
   setup.sh            symlinks, helper builds, resolve check (available)
-  scripts/            measurement, analysis and figure code  (pending)
+  scripts/            measurement code (C++ helpers available;
+                      the measurement stages pending)
   results/            small, reviewable result files         (pending)
   figs/               figures regenerated from results/      (pending)
 ```
@@ -144,7 +145,7 @@ One idempotent pass that puts a machine in a runnable state and then proves it:
 | 2 | finds `MODEL_ROOT` by searching for a marker directory (`SETUP_MARKERS`) |
 | 3 | links every `engines_*` tree it finds into `ENGINE_ROOT` and prints engine counts |
 | 4 | sources `env.sh`, runs `configure.sh`, checks no placeholder is left |
-| 5 | builds the C++ helpers (row loop, streaming ASR harness, issue-rate probe) against the TensorRT root derived from the `trtexec` on PATH, at the compute capability read from the device |
+| 5 | builds the C++ helpers against the TensorRT root derived from the `trtexec` on PATH, at the compute capability read from the device. Every helper reports — built, already built, or source not present — so a missing one is never a silent skip |
 | 6 | opens every expanded mix and reports **`N/N paths this device needs resolve`** |
 
 **§6 is the acceptance number**, and it is what makes the stage worth running: it
@@ -152,6 +153,12 @@ tells you before a forty-minute engine build whether a manifest has a typo.
 Missing rows are listed by path — link or build them and re-run. Rows tagged for
 another device (`mix_<tag>_*.csv`, tag from the platform or `MIX_TAG`) and the
 shipped `/path/to/...` template rows are skipped and counted separately.
+
+Two helpers ship now: `scripts/model_bench/cpp/row_loop.cpp`, the paced engine
+loop the co-location stages drive (no Python in the timed path), and
+`scripts/device_ceilings/peak_issue_probe.cu`, the tensor issue-rate probe.
+`setup.sh` writes `ROW_LOOP` into `.setup_env` only when the binary really
+exists, so a downstream stage never inherits a path to something unbuilt.
 
 Exits non-zero on a blocking problem. A desktop session or a non-maximum power
 mode is a warning, not a block — those matter for certified numbers, not setup.
