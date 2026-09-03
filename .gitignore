@@ -2,7 +2,6 @@
 *.engine
 *.plan
 *.onnx
-!selftest/gemm_selftest.onnx
 *.nsys-rep
 *.sqlite
 *.ncu-rep
