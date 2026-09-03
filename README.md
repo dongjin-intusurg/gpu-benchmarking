@@ -18,10 +18,15 @@ gpu-benchmarking/
   configs/            mix and manifest templates             (available; device constants pending)
   ADDING_A_MODEL.md   how to describe a new model            (available)
   setup.sh            symlinks, helper builds, resolve check (available)
-  scripts/            measurement code (C++ helpers available;
-                      the measurement stages pending)
-  results/            small, reviewable result files         (pending)
-  figs/               figures regenerated from results/      (pending)
+  scripts/            measurement code, one directory per stage:
+    device_ceilings/  §3 device ceilings          (C++ probe available; stage pending)
+    model_bench/      §4a engine-path per-model    (C++ row loop available; stage pending)
+    serving/          §4b serving-runtime per-model                        (pending)
+    colocation/       §5 co-location and paced runs                        (pending)
+    power/            §6 power sweeps                                       (pending)
+    figures/          §7 figures and reports                               (pending)
+  results/            small, reviewable result files                       (pending)
+  figs/               figures regenerated from results/                    (pending)
 ```
 
 ## 0. Prerequisites — `prereqs.sh` (available)
@@ -171,31 +176,61 @@ mode is a warning, not a block — those matter for certified numbers, not setup
 
 ## 3. Device ceilings _(pending)_
 
-Per-precision GEMM sweep, bandwidth kernel suite, CUDA-core and sustained-vs-
-burst measurements under locked, verified clocks with drift adjudication.
-Produces the ceilings every budget divides by.
+Per-precision GEMM sweep (best-over-size is the ceiling, so large sizes only
+prove the peak — they cost most of the wall-clock and can be trimmed), a
+bandwidth kernel suite (copy / read / write / triad at several working-set
+sizes), CUDA-core fp32, and a sustained-vs-burst pass — all under locked,
+verified clocks with a pre-declared drift verdict. Produces the ceilings every
+budget divides by.
+
+The stage refuses to measure outside the regime: desktop up, a foreign GPU
+client, or the wrong power mode each block it before a clock is touched. On a
+Jetson the required mode is the device config's `required_power_mode` (a run that measures
+at a lower mode declares it there); on a discrete card the operating point is the default power limit — dialing it down is a
+deliberate sweep, not the baseline. The device config is chosen from the
+machine itself (platform, GPU name, power mode), so a run takes no arguments.
 
 ## 4. Per-model measurement _(pending)_
 
-Engine build, accuracy gate against an fp32 reference built from the same
-ONNX, certified p99, causal bytes/frame via the memory-clock dial, NCU
-roofline, and the per-model N / C / L / Score.
+**One stage, two harnesses — every model in the mix gets a solo measurement
+here, whichever harness produces it.** The number that comes out is the same in
+both cases: budgets per device (time, bandwidth, VRAM), U_max, C = 1/U_max,
+L = deadline / p99, **N = min(L, C)**, and Score = N × Σ(arch GFLOPs × Hz), with
+a cause tag (throughput- vs latency-limited). What differs is only how the
+engine is built and how latency and fidelity are measured. A manifest field
+(`MODEL_KIND`) selects the harness, and a coverage check reports any mix row
+that has no result yet — "every model covered" is a stage output, not a claim.
+
+**§4a — engine path** (vision, depth, detection). One ONNX builds both the
+quantized candidate and an fp32 reference; the accuracy gate requires ≥99%
+per-tensor agreement between them on real sample inputs; latency is a
+1000-iteration frame p99; bytes/frame come from the causal memory-clock dial;
+an NCU pass gives the roofline bound percentages.
+
+**§4b — serving-runtime path** (LLM / VLM / ASR). The quantized checkpoint is
+exported to the serving runtime — TensorRT Edge-LLM on Jetson, TensorRT-LLM on
+a discrete card — as several engines (vision encoder, decoder). Latency is
+time-to-first-token plus decode tokens/s (streaming end-to-end for ASR), and the
+fidelity gate is teacher-forced agreement against the unquantized model, since
+no fp32 reference *engine* exists. Demand has two regimes per model: decode is
+bytes-bound, prefill is compute-bound — both are measured and the deadline
+decides which governs.
 
 ## 5. Co-location and paced runs _(pending)_
 
 Multi-model arms (plain / MPS / streams / MIG where available), shared-trigger
-period makespan, and the composed budget for a target mix.
+period makespan, and the composed budget for a target mix. The solo §4 numbers
+are the inputs; this stage measures what actually happens when the rows run
+together.
 
 ## 6. Power _(pending)_
 
 Power-mode and power-cap sweeps; compute-per-watt and bandwidth-per-watt fits.
+The baseline is the device's default operating point (Jetson: the required power
+mode; discrete: the default power limit, which is also the maximum — `-pl` only
+dials down). Every other point in the sweep is a deliberate excursion from it.
 
-## 7. Serving runtime (LLM / VLM / ASR) _(pending)_
-
-Quantization ladder, decode dial, teacher-forced fidelity gate, and streaming
-ASR end-to-end on TensorRT Edge-LLM (Jetson) or TensorRT-LLM (discrete).
-
-## 8. Figures and reports _(pending)_
+## 7. Figures and reports _(pending)_
 
 Regenerates every figure and table from `results/`; the derivation layer is
 deterministic and diffable against the committed outputs.
