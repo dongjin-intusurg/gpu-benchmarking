@@ -1,0 +1,26 @@
+# Large or regenerable artifacts must never enter this repo.
+*.engine
+*.plan
+*.onnx
+!selftest/gemm_selftest.onnx
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+ncu_kernels*.csv
+*.pptx
+*.pdf
+*.zip
+*.tar.gz
+*.tar.xz
+*.7z
+*.nv7z
+__pycache__/
+*.pyc
+
+
+*.local/
+scripts/*/figs/
+engines/
+work/
+
+.setup_env

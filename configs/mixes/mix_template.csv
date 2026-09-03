@@ -1,0 +1,4 @@
+name,onnx,precision,hz,deadline_ms,arch_gflops
+depth_model,/path/to/depth_model.onnx,int8,15,66.7,17.1
+backbone_vitb,/path/to/vitb.onnx,fp16,30,33.3,500
+fusion_head,/path/to/fusion.onnx,fp16,15,66.7,120

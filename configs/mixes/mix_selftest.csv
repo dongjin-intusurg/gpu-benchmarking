@@ -1,0 +1,2 @@
+name,onnx,precision,hz,deadline_ms,arch_gflops
+gemm_selftest,${WORK_ROOT}/gemm_selftest.onnx,fp16,30,33.3,137.44

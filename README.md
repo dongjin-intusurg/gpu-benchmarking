@@ -13,11 +13,12 @@ what will land there; the scripts are not in this repository yet.
 ```
 gpu-benchmarking/
   prereqs.sh          check / install prerequisites          (available)
-  setup.sh            path contract, symlinks, helper builds (pending)
-  env.sh              root variables every script reads      (pending)
-  configure.sh        expand config templates for this host  (pending)
+  env.sh              root variables every script reads      (available)
+  configure.sh        expand config templates for this host  (available)
+  configs/            mix and manifest templates             (available; device constants pending)
+  ADDING_A_MODEL.md   how to describe a new model            (available)
+  setup.sh            symlinks, helper builds, resolve check (pending)
   scripts/            measurement, analysis and figure code  (pending)
-  configs/            device constants, mixes, manifests     (pending)
   results/            small, reviewable result files         (pending)
   figs/               figures regenerated from results/      (pending)
 ```
@@ -59,12 +60,53 @@ profiling needs root or `NVreg_RestrictProfilingToAdminUsers=0`; on a discrete
 card torch must be a CUDA build matching the toolkit; record the serving-runtime
 version with results, decode throughput depends on it.
 
-## 1. Model assets and path contract _(pending)_
+## 1. Model assets and path contract — `env.sh`, `configure.sh` (available)
 
-How to lay out model repositories, ONNX files, calibration caches and sample
-inputs under `MODEL_ROOT`, and how `env.sh` / `configure.sh` resolve the
-`${...}` placeholders in the config files so the same scripts run unchanged on
-any host.
+Nothing in the repository carries a machine-specific path. Every script reads a
+small set of roots from `env.sh`, and every config file refers to assets through
+`${ROOT}` placeholders that `configure.sh` expands for the host it runs on. Moving
+to a new machine means putting the model assets under one directory and, at most,
+exporting that directory's path.
+
+| Root | Default | Holds |
+|---|---|---|
+| `MODEL_ROOT` | `~/models` | model repositories, ONNX files, calibration caches — **the one you provide** |
+| `INPUTS_ROOT` | `$MODEL_ROOT/inputs` | sample inputs for the accuracy gates (`samples_<model>/`) |
+| `ONNX_DIR` | `$MODEL_ROOT/onnx` | per-family ONNX directories (`vfm/`, `va/`, `whisper/`, …) |
+| `ENGINE_ROOT` | `<repo>/engines` | built TensorRT engines — never committed, created on demand |
+| `WORK_ROOT` | `<repo>/work` | engine-build scratch, quantization workspaces |
+| `RESULTS_ROOT` / `FIGS_ROOT` / `CONFIG_ROOT` | `<repo>/results`, `figs`, `configs` | outputs and inputs of the derivation layer |
+| `EDGELLM_ROOT` / `TRTLLM_ROOT` | `~/tools/...` | serving runtimes (Jetson / discrete) |
+| `HANDOFF_ROOT` | `$RESULTS_ROOT/handoff` | result directories shipped in from another device |
+
+Lay the assets out (real copies or symlinks — the scripts cannot tell):
+
+```
+$MODEL_ROOT/
+    <model_a>/            each model repo as cloned: onnx/, calib/, samples/, plugins/
+    <model_b>/
+    onnx/<family>/        ONNX files for the family build scripts
+    inputs/samples_<m>/   real frames for the accuracy battery
+```
+
+Then expand the templates and check that every input path resolves:
+
+```bash
+export MODEL_ROOT=/path/to/models        # only if not ~/models
+. ./env.sh && ./configure.sh
+```
+
+`configure.sh` writes machine-local copies of `configs/mixes/*` and
+`configs/manifests/*` into `scripts/mixes.local/` and `scripts/manifests.local/`
+(git-ignored) and lists any placeholder that stayed unresolved — each one names
+an empty root. Accuracy manifests list their samples as
+`${INPUTS_ROOT}/samples_<model>/...`, and a model manifest's `ACC_MANIFEST`
+points at the expanded copy under `scripts/manifests.local/`.
+
+`configs/` ships the templates only: `mix_template.csv`, `mix_selftest.csv`,
+`mix_ceilings_only.csv` and `model_manifest.env.template`. Your own model rows
+go in files you add next to them — `ADDING_A_MODEL.md` walks through the four
+files a model needs and the rules behind each field.
 
 ## 2. Machine setup — `setup.sh` _(pending)_
 
