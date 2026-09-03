@@ -17,7 +17,7 @@ gpu-benchmarking/
   configure.sh        expand config templates for this host  (available)
   configs/            mix and manifest templates             (available; device constants pending)
   ADDING_A_MODEL.md   how to describe a new model            (available)
-  setup.sh            symlinks, helper builds, resolve check (pending)
+  setup.sh            symlinks, helper builds, resolve check (available)
   scripts/            measurement, analysis and figure code  (pending)
   results/            small, reviewable result files         (pending)
   figs/               figures regenerated from results/      (pending)
@@ -129,11 +129,32 @@ points at the expanded copy under `scripts/manifests.local/`.
 go in files you add next to them — `ADDING_A_MODEL.md` walks through the four
 files a model needs and the rules behind each field.
 
-## 2. Machine setup — `setup.sh` _(pending)_
+## 2. Machine setup — `setup.sh` (available)
 
-Discovers the model root, links engine directories, sources the environment,
-builds the C++ helpers (row loop, streaming ASR harness, issue-rate probe) at
-the detected compute capability, and verifies every config row resolves.
+One idempotent pass that puts a machine in a runnable state and then proves it:
+
+```bash
+./setup.sh --model-root $MODEL_ROOT --search $MODEL_ROOT --search <where your ONNX live>
+. ./.setup_env          # later shells need only this
+```
+
+| § | Does |
+|---|---|
+| 1 | machine state: platform, power mode (Jetson) or power cap (discrete), online CPUs, desktop session, foreign GPU clients, stale VRAM |
+| 2 | finds `MODEL_ROOT` by searching for a marker directory (`SETUP_MARKERS`) |
+| 3 | links every `engines_*` tree it finds into `ENGINE_ROOT` and prints engine counts |
+| 4 | sources `env.sh`, runs `configure.sh`, checks no placeholder is left |
+| 5 | builds the C++ helpers (row loop, streaming ASR harness, issue-rate probe) against the TensorRT root derived from the `trtexec` on PATH, at the compute capability read from the device |
+| 6 | opens every expanded mix and reports **`N/N paths this device needs resolve`** |
+
+**§6 is the acceptance number**, and it is what makes the stage worth running: it
+tells you before a forty-minute engine build whether a manifest has a typo.
+Missing rows are listed by path — link or build them and re-run. Rows tagged for
+another device (`mix_<tag>_*.csv`, tag from the platform or `MIX_TAG`) and the
+shipped `/path/to/...` template rows are skipped and counted separately.
+
+Exits non-zero on a blocking problem. A desktop session or a non-maximum power
+mode is a warning, not a block — those matter for certified numbers, not setup.
 
 ## 3. Device ceilings _(pending)_
 
