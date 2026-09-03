@@ -78,7 +78,7 @@ if [ -z "${MODEL_ROOT:-}" ]; then
   done
 fi
 if [ -n "${MODEL_ROOT:-}" ] && [ -d "$MODEL_ROOT" ]; then ok "MODEL_ROOT=$MODEL_ROOT"
-else bad "MODEL_ROOT not found — pass --model-root <dir containing the model repos>"; MODEL_ROOT="${MODEL_ROOT:-$HOME/models}"; fi
+else bad "MODEL_ROOT not found under ${SEARCH[*]} — pass --model-root <dir holding the model repos>, or set SETUP_MARKERS to a directory name that identifies your model tree (currently: ${SETUP_MARKERS:-model-assets})"; MODEL_ROOT="${MODEL_ROOT:-$HOME/models}"; fi
 export MODEL_ROOT
 
 echo
@@ -224,6 +224,7 @@ if tot == 0:
     if res["template"] or res["other_device"]:
         print("        nothing to check yet - only template / other-device rows are present;"
               " add your own mix next to the shipped ones")
+        sys.exit(3)          # nothing verified: not a pass, not a failure
     else:
         print("        NO ROWS CHECKED - scripts/mixes.local is empty; run ./configure.sh")
         sys.exit(1)
@@ -235,7 +236,11 @@ for base, name, path in res["missing"]:
     seen.add(path); print(f"        MISSING  {name or '?':26s} {path}")
 sys.exit(1 if res["missing"] else 0)
 PYEOF
-[ $? -eq 0 ] && ok "every mix row resolves" || warn "some rows unresolved — build or link the engines above, then re-run ./setup.sh"
+case $? in
+  0) ok "every mix row resolves";;
+  3) warn "no rows were checked — this stage verified nothing; add a mix for this device";;
+  *) warn "some rows unresolved — build or link the engines above, then re-run ./setup.sh";;
+esac
 
 echo
 echo "=== summary ==="

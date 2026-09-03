@@ -139,6 +139,10 @@ One idempotent pass that puts a machine in a runnable state and then proves it:
 . ./.setup_env          # later shells need only this
 ```
 
+`--model-root` is normally required: discovery looks for a marker directory that
+identifies a model tree, and the default name (`SETUP_MARKERS=model-assets`) will
+not match your layout until you set it to one that does.
+
 | § | Does |
 |---|---|
 | 1 | machine state: platform, power mode (Jetson) or power cap (discrete), online CPUs, desktop session, foreign GPU clients, stale VRAM |
@@ -152,7 +156,9 @@ One idempotent pass that puts a machine in a runnable state and then proves it:
 tells you before a forty-minute engine build whether a manifest has a typo.
 Missing rows are listed by path — link or build them and re-run. Rows tagged for
 another device (`mix_<tag>_*.csv`, tag from the platform or `MIX_TAG`) and the
-shipped `/path/to/...` template rows are skipped and counted separately.
+shipped `/path/to/...` template rows are skipped and counted separately, and if
+those are all there is, the stage says it verified nothing rather than reporting
+a pass over an empty set.
 
 Two helpers ship now: `scripts/model_bench/cpp/row_loop.cpp`, the paced engine
 loop the co-location stages drive (no Python in the timed path), and
