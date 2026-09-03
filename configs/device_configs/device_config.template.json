@@ -1,17 +1,14 @@
 {
   "_README": "Copy to <your-device>.json and fill from the vendor datasheet + your own probes. Every ceiling tool reads this via --device / DEVICE_CFG. setup and the ceilings runner pick the file whose platform and device_name_match fit the machine, and (jetson) whose required_power_mode matches the current mode.",
-
   "device_tag": "mydev",
   "device_id": "vendor-part-number",
   "device_name_match": "substring that must appear in the nvidia-smi GPU name",
-  "platform": "jetson | discrete",
+  "platform": "jetson",
   "arch": "sm_XX",
   "module": "board / carrier description (free text)",
-
   "vram_physical_mb": null,
   "vram_budget_cap_mb": null,
   "vram_note": "null = auto-detect at run time; set a cap only as a deliberate budget policy",
-
   "datasheet": {
     "peak_fp16_dense_tflops": 0,
     "peak_int8_dense_tops": 0,
@@ -23,28 +20,48 @@
     "retrieved": "YYYY-MM-DD",
     "notes": "dense (non-sparse) figures; record how any sparse headline was de-rated"
   },
-
-  "clock_sources": {"gpu_cur_freq": "path or nvidia-smi field", "mem_cur_freq": "path or nvidia-smi field"},
+  "clock_sources": {
+    "gpu_cur_freq": "path or nvidia-smi field",
+    "mem_cur_freq": "path or nvidia-smi field"
+  },
   "lock_method": "jetson_clocks | nvidia-smi",
-  "lock_targets_mhz": {"gpu": 0, "emc": 0},
-  "power_sources": {"note": "where power.draw is read (sysfs rail on jetson, NVML on discrete)"},
-  "throttle_sources": {"note": "throttle / overcurrent counters, if any"},
-  "thermal": {"tj_source": "path or field", "tj_limit_c": 0},
-
+  "lock_targets_mhz": {
+    "gpu": 0,
+    "emc": 0
+  },
+  "power_sources": {
+    "note": "where power.draw is read (sysfs rail on jetson, NVML on discrete)"
+  },
+  "throttle_sources": {
+    "note": "throttle / overcurrent counters, if any"
+  },
+  "thermal": {
+    "tj_source": "path or field",
+    "tj_limit_c": 0
+  },
   "power_envelope_w": 0,
   "idle_power_w_expected": 0,
   "sampler_period_s": 0.1,
   "sampler_period_note": "avoid a period that phase-locks to the workload's frame rate",
-
-  "emc_dial": {"note": "memory-clock bins the causal bytes/frame dial can step through, if supported"},
-  "ops_per_tinst": {"note": "per-arch tensor-instruction op counts; calibrate once against the known-truth GEMM before any roofline"},
-
-  "sanity_bands": {
-    "gemm_frac_of_datasheet": [0.45, 0.95],
-    "bw_idle_frac_of_datasheet": [0.75, 0.95]
+  "emc_dial": {
+    "note": "memory-clock bins the causal bytes/frame dial can step through, if supported"
   },
-
-  "quirks": ["free-text notes on this part's measured behaviour under lock"],
-
-  "required_power_mode": "MAXN"
+  "ops_per_tinst": {
+    "note": "per-arch tensor-instruction op counts; calibrate once against the known-truth GEMM before any roofline"
+  },
+  "sanity_bands": {
+    "gemm_frac_of_datasheet": [
+      0.45,
+      0.95
+    ],
+    "bw_idle_frac_of_datasheet": [
+      0.75,
+      0.95
+    ]
+  },
+  "quirks": [
+    "free-text notes on this part's measured behaviour under lock"
+  ],
+  "required_power_mode": "MAXN",
+  "_platform_note": "set to \"jetson\" or \"discrete\" (must be exactly one; this decides every platform-specific branch)"
 }

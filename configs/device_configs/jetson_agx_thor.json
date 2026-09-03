@@ -1,0 +1,102 @@
+{
+ "_README": "A filled, working example (Jetson AGX Thor-class, values from the public product page). Copy the template for other devices. Machine-specific configs you add should be named <name>.local.json (gitignored).",
+ "device_tag": "thor",
+ "device_id": "thor_t5000",
+ "device_name_match": "NVIDIA Thor",
+ "platform": "jetson",
+ "arch": "sm_110",
+ "module": "p3834-0008 (Jetson AGX Thor T5000, carrier p4071-0000)",
+ "vram_physical_mb": null,
+ "vram_budget_cap_mb": null,
+ "vram_note": "unified memory - capacity auto-detected from MemTotal at run time",
+ "datasheet": {
+  "peak_fp16_dense_tflops": 259,
+  "peak_int8_dense_tops": 517,
+  "peak_fp8_dense_tflops": 517,
+  "peak_fp32_cuda_tflops": 7.1,
+  "peak_bw_gbps": 273,
+  "tdp_w": 130,
+  "source_url": "https://developer.nvidia.com/embedded/jetson-agx-thor",
+  "retrieved": "2026-08-07",
+  "notes": "dense (non-sparse) figures; 2070 FP4-sparse TFLOPS headline / 8 = 259 fp16 dense;; dense (non-sparse) figures"
+ },
+ "clock_sources": {
+  "type": "devfreq",
+  "gpu_mhz": {
+   "dir": "/sys/class/devfreq/gpu-gpc-0",
+   "scale_hz_to_mhz": 1e-06
+  },
+  "emc_mhz": {
+   "dir": "/sys/class/devfreq/bwmgr",
+   "scale_hz_to_mhz": 1e-06
+  }
+ },
+ "lock_method": "jetson_clocks",
+ "lock_targets_mhz": {
+  "gpu": 1575,
+  "emc": 4266
+ },
+ "power_sources": {
+  "module_w": {
+   "hwmon_name": "ina238",
+   "attr": "power1_input",
+   "scale": 1e-06
+  },
+  "vdd_gpu": {
+   "hwmon_name": "ina3221",
+   "label": "VDD_GPU",
+   "curr_attr": "curr1_input",
+   "volt_attr": "in1_input",
+   "note": "watts = mV * mA / 1e6; resolve hwmon index by name, never hardcode hwmonN"
+  }
+ },
+ "throttle_sources": {
+  "soctherm_oc": {
+   "hwmon_name": "soctherm_oc",
+   "note": "overcurrent throttle sensor; attribute layout undocumented - sample best-effort, blank field if unreadable"
+  }
+ },
+ "thermal": {
+  "tj_c": {
+   "zone_type": "tj-thermal",
+   "scale": 0.001,
+   "note": "resolve /sys/devices/virtual/thermal/thermal_zone*/type by name"
+  }
+ },
+ "power_envelope_w": 130,
+ "idle_power_w_expected": 29,
+ "sampler_period_s": 0.0731,
+ "emc_dial": {
+  "method": "devfreq-sysfs",
+  "node": "/sys/class/devfreq/bwmgr",
+  "freqs_hz": [
+   4266000000,
+   3200000000,
+   2750000000
+  ]
+ },
+ "ops_per_tinst": {
+  "int8": 2048,
+  "fp16": 1024
+ },
+ "sanity_bands": {
+  "gemm_frac_of_datasheet": [
+   0.45,
+   0.95
+  ],
+  "bw_idle_frac_of_datasheet": [
+   0.75,
+   0.95
+  ]
+ },
+ "quirks": [
+  "nvidia-smi on Tegra reports no per-process memory, no VBIOS/serial, no power cap",
+  "an empty compute-apps list is NOT evidence of idleness - corroborate with the INA238 idle-power baseline",
+  "trtexec lives only at /usr/src/tensorrt/bin - not on default PATH",
+  "jetson_clocks --show needs root; /sys/class/devfreq/* is readable unprivileged and is the authoritative lock check (min==max==cur)",
+  "/sys/devices/gpu.0/** does not exist on tegra264 - Xavier/Orin layout, do not probe",
+  "overcurrent clamps are ms-scale: throughput dips 15-30% while sampled clocks read max - they are data, not lock failure"
+ ],
+ "sampler_period_note": "73.1 ms, not a multiple of the 33.3 ms frame: the ina238 module-power register is instantaneous (no averaging) and a 100 ms poll phase-locks to a 30 Hz row (2026-08-28 finding); VDD_GPU on the ina3221 is hardware-averaged (512 samples) and unaffected",
+ "required_power_mode": "MAXN"
+}

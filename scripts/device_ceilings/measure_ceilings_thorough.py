@@ -98,7 +98,9 @@ def rep3(fn, unit, iters=20):
             'clamped_reps': 5 - len(clean)}
 
 # ---------- 1. tensor GEMM sweep ----------
-sizes = [1024, 1536, 2048, 3072, 4096, 5120, 6144, 8192, 10240, 12288, 16384]
+_defsz = [1024, 1536, 2048, 3072, 4096, 5120, 6144, 8192, 10240, 12288, 16384]
+_raw = os.environ.get('CEIL_GEMM_SIZES', '').replace(',', ' ').split()
+sizes = [int(x) for x in _raw] if _raw else _defsz   # CEIL_GEMM_SIZES=2048 for a smoke pass
 print('== suite 1: tensor GEMM sweep ==', flush=True)
 for n in sizes:
     flop = 2.0 * n**3
@@ -207,7 +209,8 @@ del a, b; torch.cuda.empty_cache()
 
 # ---------- 6. sustained vs burst (3 min) ----------
 SUST = os.environ.get('SUSTAIN_PREC', 'fp16')
-print(f'== suite 6: sustained {SUST} GEMM, 3 minutes ==', flush=True)
+SUST_SECS = int(os.environ.get('SUSTAIN_SECONDS', '180'))   # default 3 min; lower for a smoke pass
+print(f'== suite 6: sustained {SUST} GEMM, {SUST_SECS}s ==', flush=True)
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 n = 4096; flop = 2.0*n**3
 if SUST == 'int8':
@@ -217,14 +220,14 @@ if SUST == 'int8':
 else:
     a = torch.rand(n, n, device=dev, dtype=torch.float16); b = torch.rand(n, n, device=dev, dtype=torch.float16)
     step = lambda: (a @ b)
-t_end = time.time() + 180
+t_end = time.time() + SUST_SECS
 while time.time() < t_end:
     s, e = torch.cuda.Event(True), torch.cuda.Event(True)
     s.record()
     for _ in range(60): step()
     e.record(); torch.cuda.synchronize()
     tf = flop*60/(s.elapsed_time(e)/1e3)/1e12
-    R['sustained'].append({'t': round(time.time()-(t_end-180), 0), 'tflops': round(tf, 1),
+    R['sustained'].append({'t': round(time.time()-(t_end-SUST_SECS), 0), 'tflops': round(tf, 1),
                            'gpu_mhz': gpu_freq_mhz(), 'max_temp_c': max_temp_c()})
     print(f'  +{R["sustained"][-1]["t"]:4.0f}s  {tf:6.1f} TFLOPS  {R["sustained"][-1]["gpu_mhz"]} MHz  {R["sustained"][-1]["max_temp_c"]}°C', flush=True)
 

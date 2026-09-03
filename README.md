@@ -215,8 +215,25 @@ gate that catches a peak that moved between runs; a GEMM ceiling legitimately
 peaks at a mid size, so only a shift between runs is the signal, not the peak
 itself).
 
-Fill a device config from `configs/device_configs/device_config.template.json`
-before first use.
+**Device config.** The stage reads a per-device config (datasheet peaks, clock
+targets, sanity bands) and picks the one matching this machine — platform, the
+`nvidia-smi` name, and (Jetson) the current power mode. `configs/device_configs/`
+ships a filled Jetson example and a `device_config.template.json`. For any other
+card, copy the template to `<name>.local.json` (git-ignored) and fill the
+`platform`, `device_name_match`, `datasheet` block and `required_power_mode` —
+the datasheet peaks are what the sanity bands divide by, so they are required.
+
+**Smoke check.** `CEIL_SMOKE=1 ./run_device_ceilings.sh` runs one GEMM size and
+one precision with short passes — ~2 minutes, enough to prove preflight → lock →
+verify → measure → drift → report is wired end to end. The numbers are **not**
+ceilings (too few sizes to find a peak); it is a plumbing test. `CEIL_GEMM_SIZES`,
+`TRT_GEMM_SIZES` and `TRT_GEMM_PRECISIONS` give finer control.
+
+**If you hard-kill a run** (SIGKILL / `kill -9` of the group), the EXIT-trap clock
+restore does not run and the clocks stay pinned — silently biasing whatever
+measures next. Release by hand: Jetson `sudo jetson_clocks --restore
+<run>/provenance/jetson_clocks_saved.conf` (or reboot); discrete `sudo nvidia-smi
+-rgc -rmc`. Normal exit, `set -e`, and Ctrl-C are covered by the trap.
 
 ## 4. Per-model measurement _(pending)_
 

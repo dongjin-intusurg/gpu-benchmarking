@@ -13,7 +13,12 @@
 #   1. preflight     — refuse to measure with a desktop or foreign GPU clients
 #                      present (--require-maxn on jetson: ceilings need MAXN)
 #   2. clock lock    — jetson_clocks store+apply | nvidia-smi -pm/-lgc/-lmc;
-#                      an EXIT trap always restores the pre-run state
+#                      an EXIT trap restores the pre-run state on normal exit,
+#                      set -e, and Ctrl-C — but NOT on SIGKILL of the process
+#                      group. If you hard-kill a run, the clocks stay pinned and
+#                      silently bias whatever measures next: check and release by
+#                      hand -- jetson:  sudo jetson_clocks --restore <prov>/jetson_clocks_saved.conf
+#                                       (or reboot); discrete:  sudo nvidia-smi -rgc -rmc
 #   3. verify_lock   — abort before measuring anything if the lock did not take
 #   4. provenance    — environment snapshot + nvidia-smi -q (+ preflight.json)
 #   5. measure       — measure_ceilings_thorough.py (~15 GPU-minutes) with
@@ -33,6 +38,11 @@
 #   SUSTAIN_PREC  (optional) forwarded to suite 6 (fp16 default, int8 option);
 #                 recorded in provenance and meta.sustain_prec so downstream
 #                 readers attribute the sustained samples correctly
+#   CEIL_SMOKE=1  (optional) plumbing check: one GEMM size, one precision, short
+#                 passes. Proves the whole pipeline runs in ~2 min; the numbers
+#                 are NOT ceilings (too few sizes to find a peak) — for wiring,
+#                 not measurement. Overrides: CEIL_GEMM_SIZES, TRT_GEMM_SIZES,
+#                 TRT_GEMM_PRECISIONS give finer control.
 #   ALLOW_DESKTOP=1  pass --allow-desktop to preflight (smoke runs only —
 #                 stamps smoke_only:true, numbers invalid downstream)
 #=============================================================================
@@ -41,10 +51,23 @@ set -euo pipefail
 KIT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$PATH:/usr/src/tensorrt/bin"
 
+if [ -n "${CEIL_SMOKE:-}" ]; then
+  : "${TRT_GEMM_SIZES:=2048}" "${TRT_GEMM_PRECISIONS:=fp16}" "${CEIL_GEMM_SIZES:=2048}"
+  : "${TRT_ITERATIONS:=50}" "${TRT_DURATION_S:=2}" "${SUSTAIN_SECONDS:=10}"
+  export TRT_GEMM_SIZES TRT_GEMM_PRECISIONS CEIL_GEMM_SIZES TRT_ITERATIONS TRT_DURATION_S SUSTAIN_SECONDS
+fi
+
 die() { echo "[FATAL] $*" >&2; exit 1; }
 
-[ -n "${DEVICE_CFG:-}" ] || die "DEVICE_CFG is not set. Point it at a device config first, e.g.
-  export DEVICE_CFG=$KIT_DIR/device_configs/thor_t5000.json   (or rtx_pro_5000.json)"
+# Auto-select the config from the machine when DEVICE_CFG is unset, so this entry
+# point also takes no arguments (matches run_ceilings_only.sh). DEVICE_CFG still wins.
+if [ -z "${DEVICE_CFG:-}" ]; then
+  DEVICE_CFG="$(python3 "$KIT_DIR/common/pick_device_config.py" 2>/dev/null)" \
+    || die "could not choose a device config for this machine. Fill one from
+  configs/device_configs/device_config.template.json (set platform, device_name_match,
+  the datasheet block, required_power_mode) and drop it in configs/device_configs/,
+  or point DEVICE_CFG at it directly."
+fi
 [ -f "$DEVICE_CFG" ] || die "DEVICE_CFG does not exist: $DEVICE_CFG"
 
 cfg_get() {

@@ -22,3 +22,7 @@ work/
 
 .setup_env
 .bench_env.sh
+
+# machine-specific device configs (fill from the template); shipped examples are tracked
+configs/device_configs/*.local.json
+scripts/device_configs/

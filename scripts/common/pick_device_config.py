@@ -33,7 +33,28 @@ def current_mode():
 
 
 def main():
-    d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "device_configs")
+    here = os.path.dirname(os.path.abspath(__file__))
+    if len(sys.argv) > 1:
+        search = [sys.argv[1]]
+    else:
+        # a device config can live in either layout: configs/device_configs/
+        # (the repo's shipped location, a sibling of scripts/) or
+        # device_configs/ next to the stage scripts (the bundle mirror).
+        # DEVICE_CONFIG_DIR overrides. First existing dir with a *.json wins.
+        # order: explicit override, then the stage-adjacent dir (device_configs/
+        # beside the scripts), then the repo's configs/device_configs. The first
+        # existing dir that holds a *.json wins - whichever layout this checkout uses.
+        search = [os.environ.get("DEVICE_CONFIG_DIR", ""),
+                  os.path.join(here, "..", "device_configs"),
+                  os.path.join(here, "..", "..", "configs", "device_configs")]
+    d = None
+    for cand in search:
+        if cand and os.path.isdir(cand) and glob.glob(os.path.join(cand, "*.json")):
+            d = cand; break
+    if d is None:
+        print("no device_configs directory with a *.json found; looked in: "
+              + ", ".join(x for x in search if x), file=sys.stderr)
+        return 1
     platform = "jetson" if os.path.exists("/etc/nv_tegra_release") else "discrete"
     smi = sh("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").splitlines()
     smi_name = smi[0].strip() if smi else ""
