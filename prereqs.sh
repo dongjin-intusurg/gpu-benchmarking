@@ -28,7 +28,6 @@ pyimp(){ python3 -c "import $1;print(getattr($1,'__version__','present'))" 2>/de
 export BENCH_ENV_SH="${BENCH_ENV_SH:-}"
 [ -z "$BENCH_ENV_SH" ] && [ -r "$KITDIR/.bench_env.sh" ] && export BENCH_ENV_SH="$KITDIR/.bench_env.sh"
 export BENCH_PY="${BENCH_PY:-${TRTLLM_PY:-}}"
-[ -z "$BENCH_PY" ] && [ -x "$HOME/venv_trtllm/bin/python" ] && export BENCH_PY="$HOME/venv_trtllm/bin/python"
 pyimp_alt(){ # module -> version via BENCH_ENV_SH / BENCH_PY; empty if neither resolves it
   BENCH_MOD="$1" bash <<'EOS' 2>/dev/null | tail -1
 [ -n "${BENCH_ENV_SH:-}" ] && [ -r "$BENCH_ENV_SH" ] && . "$BENCH_ENV_SH" >/dev/null 2>&1
@@ -60,13 +59,21 @@ want(){ case "$TIER:$1" in figures:figures) return 0;; measure:figures|measure:m
 echo "=== platform ==="
 . /etc/os-release 2>/dev/null || true
 printf "  %-26s %s (%s)\n" "os" "${PRETTY_NAME:-unknown}" "$(uname -m)"
-if [ -f /etc/nv_tegra_release ]; then
-  printf "  %-26s %s\n" "platform" "Jetson — $(sed -n 's/# \(R[0-9]*\) (release), REVISION: \([0-9.]*\).*/\1 rev \2/p' /etc/nv_tegra_release)"
+# One switch drives every platform-specific check below, so a Jetson never runs a
+# discrete branch and a discrete card never runs a Jetson one.
+# BENCH_PLATFORM=jetson|discrete forces it, for exercising the other path.
+if [ -n "${BENCH_PLATFORM:-}" ];  then PLATFORM="$BENCH_PLATFORM"
+elif [ -f /etc/nv_tegra_release ]; then PLATFORM=jetson
+else                                   PLATFORM=discrete; fi
+if [ "$PLATFORM" = jetson ]; then
+  REL=$(sed -n 's/# \(R[0-9]*\) (release), REVISION: \([0-9.]*\).*/\1 rev \2/p' /etc/nv_tegra_release 2>/dev/null)
+  printf "  %-26s %s\n" "platform" "Jetson${REL:+ — $REL}"
   IS_JETSON=1
 else
   printf "  %-26s %s\n" "platform" "discrete"
   IS_JETSON=0
 fi
+[ -n "${BENCH_PLATFORM:-}" ] && printf "  %-26s %s\n" "platform override" "BENCH_PLATFORM=$BENCH_PLATFORM"
 echo
 
 #--------------------------------------------------------------- python modules
@@ -100,7 +107,13 @@ bin(){ # name tier apt-package extra-search-path note
   fi
   if [ -n "$p" ]; then ok "$1" "$p"; else miss "$1" "${5:-}"; [ -n "${3:-}" ] && APT+=("$3"); fi
 }
-bin trtexec  measure ""            /usr/src/tensorrt/bin  "ships in /usr/src/tensorrt/bin with libnvinfer-bin"
+if [ "$IS_JETSON" = 1 ]; then
+  bin trtexec measure "" /usr/src/tensorrt/bin "ships in /usr/src/tensorrt/bin with libnvinfer-bin"
+else
+  _TRTBIN=""; for _d in ${TENSORRT_ROOT:+"$TENSORRT_ROOT/bin"} /opt/tensorrt/*/bin; do
+    [ -x "$_d/trtexec" ] && { _TRTBIN="$_d"; break; }; done
+  bin trtexec measure "" "$_TRTBIN" "a discrete box normally has the TensorRT tarball under /opt/tensorrt/<version>"
+fi
 bin g++      measure build-essential
 bin cmake    measure cmake
 bin nvcc     measure ""            /usr/local/cuda/bin    "CUDA toolkit"
@@ -127,7 +140,7 @@ MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo "$(uname 
 TRT_ROOT="${TENSORRT_ROOT:-}"
 if [ -z "$TRT_ROOT" ]; then
   _tx=$(command -v trtexec 2>/dev/null || true)
-  [ -z "$_tx" ] && [ -x /usr/src/tensorrt/bin/trtexec ] && _tx=/usr/src/tensorrt/bin/trtexec
+  [ -z "$_tx" ] && [ "$IS_JETSON" = 1 ] && [ -x /usr/src/tensorrt/bin/trtexec ] && _tx=/usr/src/tensorrt/bin/trtexec
   [ -n "$_tx" ] && TRT_ROOT=$(cd "$(dirname "$_tx")/.." 2>/dev/null && pwd)
 fi
 TRT_INC_DIRS="/usr/include/$MULTIARCH /usr/include"
@@ -193,13 +206,14 @@ if [ "$IS_JETSON" = 1 ]; then
   [ -n "$V" ] && ok "tensorrt_edgellm" "$V" || { miss "tensorrt_edgellm" "the python side of the same tree"; NEED_EDGELLM=1; }
 else
   TR="${TRTLLM_ROOT:-$HOME/tools/TensorRT-LLM}"
+  # discrete-only convenience: the conventional venv location, if nothing else was set
+  [ -z "$BENCH_PY" ] && [ -x "$HOME/venv_trtllm/bin/python" ] && export BENCH_PY="$HOME/venv_trtllm/bin/python"
   V=$(pyimp tensorrt_llm)
   if [ -n "$V" ]; then ok "tensorrt_llm" "$V"
   else
     V=$(pyimp_alt tensorrt_llm)
     if [ -n "$V" ]; then
-      note "tensorrt_llm" "$V — via ${BENCH_ENV_SH:-$BENCH_PY}, not the system interpreter"
-      note "" "the stages must run under that same environment"
+      note "tensorrt_llm" "$V — via ${BENCH_ENV_SH:-$BENCH_PY}; the stages must run under that same environment"
       OKN=$((OKN+1))
     else miss "tensorrt_llm" "the discrete card's serving runtime"; NEED_TRTLLM=1; fi
   fi

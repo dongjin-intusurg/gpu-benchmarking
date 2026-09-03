@@ -52,6 +52,11 @@ skips whatever is already present.
   Override with `EDGELLM_ROOT`, `EDGELLM_REPO`, `EDGELLM_REF`, `CUDA_ARCH`, `PYL`.
 - Flags the environment, not just packages: desktop session up, counter
   profiling restricted, `sudo` cached.
+- Runs one platform's checks and only that platform's: a Jetson never executes a
+  discrete branch and a discrete card never executes a Jetson one. Detection is
+  `/etc/nv_tegra_release`; `BENCH_PLATFORM=jetson|discrete` forces it so either
+  path can be exercised from the other machine. `env.sh` exports the result as
+  `PLATFORM` and gates its own platform-specific lines the same way.
 - Resolves the TensorRT headers per platform rather than assuming one layout:
   JetPack keeps them in the multiarch include dir, a discrete box normally has a
   tarball whose headers sit beside the `trtexec` actually on `PATH` (which is what

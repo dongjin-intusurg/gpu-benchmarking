@@ -8,6 +8,15 @@ export RESULTS_ROOT="${RESULTS_ROOT:-$KIT_ROOT/results}"
 export CONFIG_ROOT="${CONFIG_ROOT:-$KIT_ROOT/configs}"
 export FIGS_ROOT="${FIGS_ROOT:-$KIT_ROOT/figs}"
 
+# --- platform --------------------------------------------------------------
+# Every platform-specific line below keys off this one value, so a Jetson never
+# executes a discrete branch and a discrete card never executes a Jetson one.
+# BENCH_PLATFORM=jetson|discrete forces it, for exercising the other path.
+if [ -n "${BENCH_PLATFORM:-}" ];  then PLATFORM="$BENCH_PLATFORM"
+elif [ -f /etc/nv_tegra_release ]; then PLATFORM=jetson
+else                                   PLATFORM=discrete; fi
+export PLATFORM
+
 # --- what YOU provide on a new machine -------------------------------------
 # Model repositories, checkpoints and ONNX files. Everything the pipeline needs
 # from outside this repository lives under here: <MODEL_ROOT>/<model_a>,
@@ -24,18 +33,19 @@ export INPUTS_ROOT="${INPUTS_ROOT:-$MODEL_ROOT/inputs}"
 export WORK_ROOT="${WORK_ROOT:-$KIT_ROOT/work}"
 
 # --- generative stacks (only needed for the LLM / VLM / ASR rows) ------------
-export EDGELLM_ROOT="${EDGELLM_ROOT:-$HOME/tools/TensorRT-Edge-LLM}"   # Jetson
-export TRTLLM_ROOT="${TRTLLM_ROOT:-$HOME/tools/TensorRT-LLM}"          # discrete
-[ -d "$TRTLLM_ROOT" ] || [ ! -d "${TRTLLM_ROOT}-main" ] || export TRTLLM_ROOT="${TRTLLM_ROOT}-main"
+export EDGELLM_ROOT="${EDGELLM_ROOT:-$HOME/tools/TensorRT-Edge-LLM}"
+export TRTLLM_ROOT="${TRTLLM_ROOT:-$HOME/tools/TensorRT-LLM}"
 export LLM_WORKSPACE="${LLM_WORKSPACE:-$WORK_ROOT/llm-workspace}"      # quantize/export
-# TensorRT-LLM is normally installed into its own venv rather than the system
-# interpreter. Point these at it (or leave unset) — prereqs.sh and the generative
-# stages use them instead of assuming python3 can import the runtime.
 # An untracked .bench_env.sh beside this file is picked up automatically, so each
 # machine can describe its own runtime without editing anything tracked.
 export BENCH_ENV_SH="${BENCH_ENV_SH:-}"          # a file to source first (sets LD_LIBRARY_PATH etc.)
 [ -z "$BENCH_ENV_SH" ] && [ -r "$KIT_ROOT/.bench_env.sh" ] && export BENCH_ENV_SH="$KIT_ROOT/.bench_env.sh"
 export BENCH_PY="${BENCH_PY:-}"                  # the interpreter that has the runtime
+if [ "$PLATFORM" = discrete ]; then
+  # TensorRT-LLM is normally installed into its own venv rather than against the
+  # system interpreter; BENCH_ENV_SH / BENCH_PY are how the stages reach it.
+  [ -d "$TRTLLM_ROOT" ] || [ ! -d "${TRTLLM_ROOT}-main" ] || export TRTLLM_ROOT="${TRTLLM_ROOT}-main"
+fi
 
 # --- shipped-in results from the other device ------------------------------
 export HANDOFF_ROOT="${HANDOFF_ROOT:-$RESULTS_ROOT/handoff}"
@@ -50,10 +60,10 @@ export EDGELLM_PLUGIN_PATH="${EDGELLM_PLUGIN_PATH:-$EDGELLM_ROOT/build/libNvInfe
 
 # --- toolchain -------------------------------------------------------------
 # JetPack puts trtexec in /usr/src/tensorrt/bin; a discrete box is usually a
-# tarball under /opt/tensorrt/<version>. Add whichever exists, and never shadow a
-# trtexec the operator already has on PATH.
-export PATH="$PATH:/usr/src/tensorrt/bin"          # JetPack location, unconditional as before
-if ! command -v trtexec >/dev/null 2>&1; then     # discrete: fall back to a tarball tree
+# tarball under /opt/tensorrt/<version>. Each platform adds only its own location.
+if [ "$PLATFORM" = jetson ]; then
+  export PATH="$PATH:/usr/src/tensorrt/bin"
+elif ! command -v trtexec >/dev/null 2>&1; then   # never shadow one already on PATH
   for _d in ${TENSORRT_ROOT:+"$TENSORRT_ROOT/bin"} /opt/tensorrt/*/bin; do
     [ -x "$_d/trtexec" ] && { export PATH="$PATH:$_d"; break; }
   done
