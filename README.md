@@ -15,11 +15,11 @@ gpu-benchmarking/
   prereqs.sh          check / install prerequisites          (available)
   env.sh              root variables every script reads      (available)
   configure.sh        expand config templates for this host  (available)
-  configs/            mix and manifest templates             (available; device constants pending)
+  configs/            mix / manifest / device-config templates       (available)
   ADDING_A_MODEL.md   how to describe a new model            (available)
   setup.sh            symlinks, helper builds, resolve check (available)
   scripts/            measurement code, one directory per stage:
-    device_ceilings/  §3 device ceilings          (C++ probe available; stage pending)
+    device_ceilings/  §3 device ceilings                             (available)
     model_bench/      §4a engine-path per-model    (C++ row loop available; stage pending)
     serving/          §4b serving-runtime per-model                        (pending)
     colocation/       §5 co-location and paced runs                        (pending)
@@ -174,21 +174,49 @@ exists, so a downstream stage never inherits a path to something unbuilt.
 Exits non-zero on a blocking problem. A desktop session or a non-maximum power
 mode is a warning, not a block — those matter for certified numbers, not setup.
 
-## 3. Device ceilings _(pending)_
+## 3. Device ceilings (available)
 
-Per-precision GEMM sweep (best-over-size is the ceiling, so large sizes only
+```bash
+sudo -v                                  # the clock lock needs root; keep it primed
+./scripts/device_ceilings/run_device_ceilings.sh          # no arguments
+./scripts/device_ceilings/validate_ceilings.py results_<tag>_ceilings --device <cfg> [--reference <dir>]
+```
+
+Per-precision GEMM sweep (best-over-size is the ceiling, so the large sizes only
 prove the peak — they cost most of the wall-clock and can be trimmed), a
 bandwidth kernel suite (copy / read / write / triad at several working-set
 sizes), CUDA-core fp32, and a sustained-vs-burst pass — all under locked,
 verified clocks with a pre-declared drift verdict. Produces the ceilings every
-budget divides by.
+budget divides by, plus a 7-section report with its own datasheet-fraction
+sanity bands.
 
-The stage refuses to measure outside the regime: desktop up, a foreign GPU
-client, or the wrong power mode each block it before a clock is touched. On a
-Jetson the required mode is the device config's `required_power_mode` (a run that measures
-at a lower mode declares it there); on a discrete card the operating point is the default power limit — dialing it down is a
-deliberate sweep, not the baseline. The device config is chosen from the
-machine itself (platform, GPU name, power mode), so a run takes no arguments.
+The stage refuses to measure outside the regime — desktop up, a foreign GPU
+client, or the wrong operating point each block it before a clock is touched:
+
+- **Jetson**: the required mode is the device config's `required_power_mode` (a
+  run that measures at a lower mode declares it there).
+- **Discrete**: the operating point is the default power limit, which is also
+  the maximum; a stale `-pl <lower>` cap is refused, because dialing down is a
+  deliberate sweep, not the baseline.
+
+The device config is chosen from the machine itself (platform, GPU name, power
+mode via `pick_device_config.py`), so the run takes **no arguments**. Results are
+tagged with the power mode when it is not the default, so a run at one mode never
+overwrites another's reference. A sudo keep-alive holds the credential for the
+length of the sweep, and the clock-restore fails fast with an actionable message
+rather than blocking on an unanswerable prompt if the cache ever lapses.
+
+`validate_ceilings.py` turns a finished run into a PASS / INVESTIGATE verdict over
+three gates: **regime integrity** (preflight + lock + drift; a drift FAIL or a
+smoke run voids everything under it), **self-sanity** (each ceiling's
+datasheet-fraction inside the config band — works with no reference at all), and
+**reproducibility** (each ceiling within tolerance of a `--reference` run — the
+gate that catches a peak that moved between runs; a GEMM ceiling legitimately
+peaks at a mid size, so only a shift between runs is the signal, not the peak
+itself).
+
+Fill a device config from `configs/device_configs/device_config.template.json`
+before first use.
 
 ## 4. Per-model measurement _(pending)_
 
