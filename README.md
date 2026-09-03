@@ -72,7 +72,7 @@ exporting that directory's path.
 |---|---|---|
 | `MODEL_ROOT` | `~/models` | model repositories, ONNX files, calibration caches — **the one you provide** |
 | `INPUTS_ROOT` | `$MODEL_ROOT/inputs` | sample inputs for the accuracy gates (`samples_<model>/`) |
-| `ONNX_DIR` | `$MODEL_ROOT/onnx` | per-family ONNX directories (`vfm/`, `va/`, `whisper/`, …) |
+| `ONNX_DIR` | `$MODEL_ROOT/onnx` | per-family ONNX directories (`vfm/`, `va/`, `asr/`, …) |
 | `ENGINE_ROOT` | `<repo>/engines` | built TensorRT engines — never committed, created on demand |
 | `WORK_ROOT` | `<repo>/work` | engine-build scratch, quantization workspaces |
 | `RESULTS_ROOT` / `FIGS_ROOT` / `CONFIG_ROOT` | `<repo>/results`, `figs`, `configs` | outputs and inputs of the derivation layer |
