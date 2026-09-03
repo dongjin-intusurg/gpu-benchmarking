@@ -7,7 +7,7 @@
  "module": "GB202-class, PCIe 5.0 x16, 384-bit GDDR7 ECC",
  "vram_physical_mb": 73728,
  "vram_budget_cap_mb": 49152,
- "vram_note": "box card is the 72 GB variant; campaign budgets are computed against the 48 GB production cap (49152 MB) - campaign policy, not a measurement",
+ "vram_note": "the 72 GB variant; budgets here are computed against a 48 GB cap (49152 MB) - a sizing policy, not a measurement",
  "datasheet": {
   "peak_fp16_dense_tflops": 258,
   "peak_int8_dense_tops": 516,
@@ -22,12 +22,12 @@
   },
   "source_url": "https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-5000/",
   "retrieved": "2026-08-07",
-  "notes": "product page headline is 2064 AI TOPS = FP4 sparse; dense ladder FP4/2 = FP8, FP8/2 = FP16, INT8 TOPS = FP8 TFLOPS per NVIDIA RTX Blackwell PRO GPU Architecture v1.0 Table 4; fp32 = 14080 cores x 2 x 2.377 GHz official boost = 66.9 TFLOPS (re-derived 2026-08-14 from SP-12389-001_v06 Table 2-1, which revised the boost clock 2026-08-13 \u2014 the earlier 73.7 assumed 2.617 GHz; measured 42.5 is now ~64% attainment). Clock ladder per the same table: base 1755 / boost 2377 / max-boost 3090 (max-boost is what clocks.max.graphics reports \u2014 a best-case bin, not a sustained promise). Power capping: 300 W threshold, 50 ms typical / 100 ms max response; EDPp allows ~540 W over 400 us windows (SP-12389-001_v06 Tables 2-9/2-10) \u2014 the electrical basis of burst-vs-governed. Bandwidth 1,344 GB/s stated as 'up to', max memory clock 14 GHz (both 48/72 GB variants). Clock basis (2026-08-18, benchmark-guide thread): DA-12900-001 Introduction attributes 2,377 MHz to RTX PRO 5000 and 2,617 MHz to RTX PRO 6000 WSE (confirmed by NVIDIA), BUT the guide's Table 4 peak column for the 5000 itself computes at ~2.6 GHz (fp16 293 = 110 SMs x 0.25 inst/clk x 4096 x ~2.6 GHz; fp32 74 = 14080x2x2.63), and their measured fp16 288 implies ~2.56 GHz realized \u2014 above the stated 2,377 max (light-load boost; 3,090 max-boost bin exists). Refined: EVERY SKU's peak column in the guide's Tables 4-5 implies a clock ~8-10% above that SKU's stated max (5000 ~2.61 vs 2.377; 6000 Max-Q ~2.37 vs 2.200; 6000 WSE ~2.83 vs 2.617) \u2014 a systematic basis question, not a SKU mixup; still open with NVIDIA. Campaign numbers unaffected: our judgments use 2,377-based derivations (fp32 66.9) and measured-vs-measured agreements at matched locked clocks."
+  "notes": "dense (non-sparse) figures. The product-page headline is FP4-sparse; the dense ladder de-rates it FP4/2 = FP8, FP8/2 = FP16, and INT8 TOPS = FP8 TFLOPS. fp32 = 14080 cores x 2 x 2.377 GHz official boost = 66.9 TFLOPS. Clock ladder: base 1755 / boost 2377 / max-boost 3090 - max-boost is what clocks.max.graphics reports, a best-case bin and not a sustained promise, so do not size against it. Bandwidth 1344 GB/s is stated as 'up to'. Note the vendor's own published peak columns imply a clock ~8-10% above each SKU's stated max, so treat any datasheet-derived peak as an upper bound."
  },
  "open_items": [
-  "ECC is configurable and DISABLED by default (SP-12389-001_v06 Table 2-3); ceilings + byte budgets were measured in the default state. If the product ships ECC-on, re-measure the bandwidth ceiling and re-run the dial before final sizing - bandwidth is the decisive axis",
+  "ECC is configurable and disabled by default; ceilings and byte budgets here were measured in that state. If the deployed part ships ECC-on, re-measure the bandwidth ceiling and re-run the dial before final sizing - bandwidth is the decisive axis",
   "Programmable power (-pl, down to ~150 W; persistent via SMBPBI) enables a power-matched per-watt experiment vs Thor (e.g. -pl 150) - optional, would replace the nameplate-based 2-2.6x per-watt estimate with a measured one",
-  "MIG with two instances is supported (Table 2-1) - a hardware-isolation option for the composition/fleet phase (pin a latency-critical model per instance)"
+  "MIG (two instances) is supported - a hardware-isolation option when co-locating a latency-critical model"
  ],
  "clock_sources": {
   "type": "nvml",
@@ -41,7 +41,7 @@
   "mem": "clocks.max.memory"
  },
  "sm_lock_mhz": 2062,
- "sm_lock_note": "sustained-bin SM lock (2026-08-12) + power-governed adjudication (same day): the 2160 request realizes 2092 cold and settles 2047-2062 warm at the 300 W cap (3-min soak wanders to 1897 while throughput holds within 10%). No useful SM clock is truly pinnable on this part - the governor holds POWER, not clock - so the lock stayed at 2160 as an upper bound and drift_report.py's power-governed rule (mem PASS + sw_power_cap only + sm median dev <= 10%) demotes the floating SM clock to recorded-data with a WARN verdict. A dev beyond 10% or any hw/thermal reason still FAILs. AMENDED 2026-08-19: lowered to 2062, the warm-settled bin. The tool_tracking run exposed a hole in the 2160-upper-bound policy: a light workload (~176 W, 1.2 ms kernels) floats 2062-2152 with NO sw_power_cap flag asserted, so the power-governed demotion cannot apply and drift hard-FAILs (pct_at_target 14.8%). Locking the holdable bin keeps requested==realized for every workload class - the same honest-terms logic as mem_lock_note. Evidence: results_rtx_tool_tracking/models/tool_tracking/clock_samples.csv (median 2062, zero throttle reasons, 176 W) vs its provenance/lock_verified.json (2137 flat under GEMM load). Ceilings remain certified at the 2026-08-12 policy (realized-2092 reference)",
+ "sm_lock_note": "This part's governor holds POWER, not clock: a 2160 MHz request realizes ~2092 cold and settles 2047-2062 warm at the 300 W cap, wandering lower over a long soak while throughput holds within 10%. Lock the warm-settled bin (2062) rather than a boost bin, so requested==realized for every workload class - a light workload floats above an upper-bound lock with no power-cap flag asserted, which makes drift adjudication hard-fail on an otherwise healthy run. drift_report.py demotes a power-governed SM deviation to WARN only when memory PASSes, the sole reason is the software power cap, and the median deviation is <= 10%.",
  "mem_lock_mhz": 13365,
  "mem_lock_note": "nameplate 14001 MHz does not hold under tensor load on this card - memory pins one supported bin down at 13365; locking there keeps requested==realized so verify_lock judges on honest terms (measured 2026-08-07)",
  "power_sources": {
@@ -67,7 +67,7 @@
   "fp16": 4096,
   "int8": 2048
  },
- "ops_per_tinst_note": "fp16 calibrated on-box 2026-08-12 (calibrate_ops_per_tinst.py, known-truth 137.44 GFLOP GEMM: 2^25 tensor insts, snap error 0.00%) - note 4x sm_110's 1024, constants do NOT transfer across architectures. int8/fp8 remain uncalibrated: when the first int8/fp8 model campaign runs here, calibrate against a known-truth engine at that precision first or the roofline will refuse those pipes",
+ "ops_per_tinst_note": "fp16 calibrated on-box against the known-truth 137.44 GFLOP GEMM (snap error 0.00%). Note it is 4x the sm_110 value - these constants do NOT transfer across architectures. int8/fp8 are uncalibrated: calibrate against a known-truth engine at that precision before running a roofline on those pipes, or it will refuse.",
  "sanity_bands": {
   "gemm_frac_of_datasheet": [
    0.45,
