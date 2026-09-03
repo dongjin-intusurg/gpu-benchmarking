@@ -52,10 +52,26 @@ skips whatever is already present.
   Override with `EDGELLM_ROOT`, `EDGELLM_REPO`, `EDGELLM_REF`, `CUDA_ARCH`, `PYL`.
 - Flags the environment, not just packages: desktop session up, counter
   profiling restricted, `sudo` cached.
+- Resolves the TensorRT headers per platform rather than assuming one layout:
+  JetPack keeps them in the multiarch include dir, a discrete box normally has a
+  tarball whose headers sit beside the `trtexec` actually on `PATH` (which is what
+  gets checked when several `/opt/tensorrt/<version>` trees are installed).
+  Override the root with `TENSORRT_ROOT`. A tarball install is never offered an
+  `apt` repair, because the `apt` candidate is often a different major version
+  and would shadow it.
+- Finds a serving runtime that lives outside the system interpreter. TensorRT-LLM
+  is usually installed into its own venv with an out-of-tree MPI on
+  `LD_LIBRARY_PATH`; set `BENCH_ENV_SH` to a file that establishes that
+  environment and/or `BENCH_PY` to the interpreter. An untracked `.bench_env.sh`
+  in the repository root is picked up automatically, so a machine can describe
+  its own runtime without editing anything tracked. The stages must then run
+  under that same environment.
 
 Exits non-zero when something blocks, so it chains: `./prereqs.sh && <next step>`.
 
-Notes: `trtexec` ships in `/usr/src/tensorrt/bin` (add to `PATH`); counter
+Notes: `trtexec` ships in `/usr/src/tensorrt/bin` on Jetson and in
+`/opt/tensorrt/<version>/bin` for a discrete tarball — `env.sh` adds whichever
+exists and never shadows one already on `PATH`; counter
 profiling needs root or `NVreg_RestrictProfilingToAdminUsers=0`; on a discrete
 card torch must be a CUDA build matching the toolkit; record the serving-runtime
 version with results, decode throughput depends on it.

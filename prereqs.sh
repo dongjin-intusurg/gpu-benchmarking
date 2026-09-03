@@ -21,6 +21,26 @@ for d in "$PYL" "$HOME/tools/edgellm-pylib" "$HOME/tools/bench-pylib"; do
 done
 pyimp(){ python3 -c "import $1;print(getattr($1,'__version__','present'))" 2>/dev/null \
       || PYTHONPATH="$PYL_SEARCH" python3 -c "import $1;print(getattr($1,'__version__','present'))" 2>/dev/null; }
+# Some runtimes are deliberately not installed against the system interpreter — a
+# discrete box usually keeps TensorRT-LLM in its own venv with an out-of-tree MPI on
+# LD_LIBRARY_PATH. Point BENCH_ENV_SH at a file that sets that environment up and/or
+# BENCH_PY at the interpreter, and the probe uses them instead of guessing.
+export BENCH_ENV_SH="${BENCH_ENV_SH:-}"
+[ -z "$BENCH_ENV_SH" ] && [ -r "$KITDIR/.bench_env.sh" ] && export BENCH_ENV_SH="$KITDIR/.bench_env.sh"
+export BENCH_PY="${BENCH_PY:-${TRTLLM_PY:-}}"
+[ -z "$BENCH_PY" ] && [ -x "$HOME/venv_trtllm/bin/python" ] && export BENCH_PY="$HOME/venv_trtllm/bin/python"
+pyimp_alt(){ # module -> version via BENCH_ENV_SH / BENCH_PY; empty if neither resolves it
+  BENCH_MOD="$1" bash <<'EOS' 2>/dev/null | tail -1
+[ -n "${BENCH_ENV_SH:-}" ] && [ -r "$BENCH_ENV_SH" ] && . "$BENCH_ENV_SH" >/dev/null 2>&1
+PY="${BENCH_PY:-${TRTLLM_PY:-python3}}"
+[ -x "$PY" ] || PY=$(command -v "$PY" 2>/dev/null) || exit 0
+[ -n "$PY" ] || exit 0
+"$PY" -c 'import importlib,os
+m=importlib.import_module(os.environ["BENCH_MOD"])
+print(getattr(m,"__version__","present"))'
+EOS
+}
+
 TIER=measure; DO_INSTALL=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -97,18 +117,49 @@ echo
 #--------------------------------------------------------------- dev headers
 if want measure; then
 echo "=== TensorRT / CUDA development files ==="
-hdr(){ local pkg="$1" file="$2"
-  if [ -e "$file" ]; then ok "$pkg" "$file"
+# Where the headers live depends on how TensorRT got here, and the two platforms
+# differ. JetPack installs them as apt packages under the multiarch include dir;
+# a discrete box is normally a tarball (or a container) where they sit beside the
+# trtexec that is actually on PATH. Deriving the root from that binary matters on
+# a machine carrying several /opt/tensorrt/<ver> trees — we must check the one the
+# builds will really use, not whichever sorts last.
+MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo "$(uname -m)-linux-gnu")
+TRT_ROOT="${TENSORRT_ROOT:-}"
+if [ -z "$TRT_ROOT" ]; then
+  _tx=$(command -v trtexec 2>/dev/null || true)
+  [ -z "$_tx" ] && [ -x /usr/src/tensorrt/bin/trtexec ] && _tx=/usr/src/tensorrt/bin/trtexec
+  [ -n "$_tx" ] && TRT_ROOT=$(cd "$(dirname "$_tx")/.." 2>/dev/null && pwd)
+fi
+TRT_INC_DIRS="/usr/include/$MULTIARCH /usr/include"
+[ -n "$TRT_ROOT" ] && [ -d "$TRT_ROOT/include" ] && TRT_INC_DIRS="$TRT_ROOT/include $TRT_INC_DIRS"
+# An apt-managed TensorRT can be repaired with apt; a tarball must not be, because
+# the apt candidate is frequently a different major version and would shadow it.
+case "${TRT_ROOT:-}" in
+  ""|/usr|/usr/src/tensorrt) TRT_KIND=apt;;
+  *)                         TRT_KIND=tarball;;
+esac
+[ "$IS_JETSON" = 1 ] && TRT_KIND=apt          # JetPack is always apt-managed
+printf "  %-26s %s\n" "header search path" "$TRT_INC_DIRS"
+
+hdr(){ local pkg="$1" file="$2" d found=""
+  for d in $TRT_INC_DIRS; do [ -e "$d/$file" ] && { found="$d/$file"; break; }; done
+  if [ -n "$found" ]; then ok "$pkg" "$found"
   elif dpkg -l "$pkg" >/dev/null 2>&1; then ok "$pkg" "installed"
-  else miss "$pkg" "$file absent"; APT+=("$pkg"); fi
+  elif [ "$TRT_KIND" = tarball ]; then
+    miss "$pkg" "$file not found under $TRT_INC_DIRS — extract the full TensorRT tarball (do NOT apt-install over it)"
+  else
+    miss "$pkg" "$file absent"; APT+=("$pkg")
+  fi
 }
-hdr libnvinfer-dev              /usr/include/aarch64-linux-gnu/NvInfer.h
-hdr libnvinfer-headers-dev      /usr/include/aarch64-linux-gnu/NvInferRuntime.h
-hdr libnvinfer-plugin-dev       /usr/include/aarch64-linux-gnu/NvInferPlugin.h
-hdr libnvinfer-headers-plugin-dev /usr/include/aarch64-linux-gnu/NvInferPluginBase.h
+hdr libnvinfer-dev              NvInfer.h
+hdr libnvinfer-headers-dev      NvInferRuntime.h
+hdr libnvinfer-plugin-dev       NvInferPlugin.h
+hdr libnvinfer-headers-plugin-dev NvInferPluginBase.h
 [ -e /usr/local/cuda/lib64/libcudart.so ] && ok "libcudart" "/usr/local/cuda/lib64" || { miss "libcudart" "the C++ harnesses will not link"; }
 V=$(dpkg -l libnvinfer10 2>/dev/null | awk '/^ii/{print $3}')
+[ -z "$V" ] && V=$(python3 -c "import tensorrt;print(tensorrt.__version__)" 2>/dev/null)
 [ -n "$V" ] && note "TensorRT version" "$V — note the full three-component version; some engine layouts encode it"
+[ "$TRT_KIND" = tarball ] && note "TensorRT install" "tarball at ${TRT_ROOT:-?} — --install will not apt-install over it"
 echo
 fi
 
@@ -144,7 +195,14 @@ else
   TR="${TRTLLM_ROOT:-$HOME/tools/TensorRT-LLM}"
   V=$(pyimp tensorrt_llm)
   if [ -n "$V" ]; then ok "tensorrt_llm" "$V"
-  else miss "tensorrt_llm" "the discrete card's serving runtime"; NEED_TRTLLM=1; fi
+  else
+    V=$(pyimp_alt tensorrt_llm)
+    if [ -n "$V" ]; then
+      note "tensorrt_llm" "$V — via ${BENCH_ENV_SH:-$BENCH_PY}, not the system interpreter"
+      note "" "the stages must run under that same environment"
+      OKN=$((OKN+1))
+    else miss "tensorrt_llm" "the discrete card's serving runtime"; NEED_TRTLLM=1; fi
+  fi
   [ -d "$TR" ] && ok "TensorRT-LLM tree" "$TR" || note "TRTLLM_ROOT" "unset — only needed for the repo's own example scripts"
 fi
 # the quantizer is pinned, and the pin matters

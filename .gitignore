@@ -22,3 +22,4 @@ engines/
 work/
 
 .setup_env
+.bench_env.sh
