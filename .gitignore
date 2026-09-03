@@ -16,8 +16,6 @@ ncu_kernels*.csv
 *.nv7z
 __pycache__/
 *.pyc
-
-
 *.local/
 scripts/*/figs/
 engines/
