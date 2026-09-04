@@ -74,7 +74,12 @@ if [ "$LIST" = 1 ]; then
 fi
 p=$(pgrep -f "build_models.sh|build_model_engines.sh|trtexec .*--saveEngine|llm_build|visual_build|measure_models.sh|run_model_bench.sh|measure_mixes.sh|run_colocation.sh" | grep -v "^$$\$" | head -3 || true)
 [ -z "$p" ] || die "a build or a measurement is running (pids: $(echo $p)) - never change the operating point under it"
-sudo -n true 2>/dev/null || die "sudo is not primed on this tty (run: sudo -v) - the knobs and the clock lock need it"
+if [ "$PLATFORM" = jetson ]; then
+  sudo -n true 2>/dev/null || die "sudo is not primed on this tty (run: sudo -v) - the knobs and the clock lock need it"
+else
+  # the discrete knob and lock only ever call nvidia-smi: accept a passwordless rule scoped to it
+  sudo -n nvidia-smi -L >/dev/null 2>&1 || die "sudo -n nvidia-smi fails - the knobs and the clock lock need it (run: sudo -v, or a NOPASSWD rule for nvidia-smi)"
+fi
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT="${OUT_DIR:-$RESULTS_ROOT/power_${DEVICE_TAG}_$STAMP}"
