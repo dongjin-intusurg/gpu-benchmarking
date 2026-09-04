@@ -264,8 +264,32 @@ def cmd_trtllm(a):
                           'prefill_cold_ms': comp.get('prefill_cold_ms'), 'decode_ms': comp.get('decode_ms'),
                           'tokens_per_s_bench': round(1000.0 / comp['decode_ms'], 2) if comp.get('decode_ms') else None,
                           'step_ms_p50': c.get('total_ms_p50'), 'n': c.get('n'), 'chunk': int(chunk), 'sweep': a.sweep}}
-    json.dump(stamp_rows([row], a.drift), open(a.out, 'w'), indent=1)
-    print(f"  {row['name']:26} step p99 {row['latency_ms']:.1f} ms  ttft {comp.get('ttft_ms')}  decode {comp.get('decode_ms')} ms/tok")
+    rows = [row]
+    if comp.get('decode_ms'):
+        # the same <row>_e2e / <row>_decode pair the Edge-LLM battery and the C++
+        # driver rows produce, so a TensorRT-LLM model can be a stage-5 side row:
+        # the measured chunk step (what the deadline judges) and the per-token
+        # decode loop at its own token rate
+        dec = float(comp['decode_ms'])
+        rows.append({'name': f"{r['row']}_e2e", 'kind': 'e2e', 'runtime': 'trtllm', 'precision': r['precision'],
+                     'latency_ms': row['latency_ms'],
+                     'latency_source': f'RequestPerfMetrics total_ms p99, chunk {chunk} (reuse on) - the measured step',
+                     'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
+                     'hz_grid': HZ_GRID, 'bytes_per_frame_MB': row['bytes_per_frame_MB'], 'bytes_source': row['bytes_source'],
+                     'vram_mb': vram, 'vram_source': vsrc,
+                     'e2e': dict(row['generative'], chunk=int(chunk), step_ms_p99=row['latency_ms'], image=r.get('image'))})
+        rows.append({'name': f"{r['row']}_decode", 'kind': 'e2e', 'runtime': 'trtllm', 'precision': r['precision'],
+                     'latency_ms': round(dec, 3), 'latency_source': 'RequestPerfMetrics decode ms/token (sweep, reuse on)',
+                     # modal: the decode loop runs at its own token rate, not the frame rate
+                     'hz': round(1000.0 / dec, 3), 'deadline_ms': float(r['deadline_ms']),
+                     'arch_gflops': 0.0, 'hz_grid': HZ_GRID,
+                     'bytes_per_frame_MB': round(eb, 1) if eb else None,
+                     'bytes_source': 'weights-stream-estimate: checkpoint bytes per token (KV traffic excluded - a lower bound)',
+                     'vram_mb': vram, 'vram_source': vsrc,
+                     'e2e': {'decode_ms': dec, 'tokens_per_second': round(1000.0 / dec, 2), 'ttft_ms': comp.get('ttft_ms')}})
+    json.dump(stamp_rows(rows, a.drift), open(a.out, 'w'), indent=1)
+    print(f"  {row['name']:26} step p99 {row['latency_ms']:.1f} ms  ttft {comp.get('ttft_ms')}  decode {comp.get('decode_ms')} ms/tok"
+          + (f"  -> +{rows[1]['name']} / {rows[2]['name']}" if len(rows) > 1 else ''))
 
 
 # ---------------------------------------------------------------------- merge

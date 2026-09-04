@@ -22,7 +22,13 @@ PY
 )"
 BIN_DIR="${COLOC_BIN_DIR:-$OUT/bin}"; BIN="$BIN_DIR/${MODEL}_e2e"; mkdir -p "$BIN_DIR"
 if [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ]; then
-  g++ -O2 -std=c++17 "$SRC" -I"/usr/include/$(gcc -dumpmachine)" -I/usr/local/cuda/include \
+  # a discrete box normally has TensorRT as a tarball beside the trtexec on PATH
+  # (its headers are not under the multiarch include dir): add its include/lib
+  # when present, as stage5_common.sh does for row_loop
+  _tx=$(command -v trtexec 2>/dev/null || true); _tr="${TENSORRT_ROOT:-}"
+  [ -z "$_tr" ] && [ -n "$_tx" ] && _tr=$(cd "$(dirname "$_tx")/.." 2>/dev/null && pwd)
+  g++ -O2 -std=c++17 "$SRC" ${_tr:+$([ -d "$_tr/include" ] && echo "-I$_tr/include")} ${_tr:+$([ -d "$_tr/lib" ] && echo "-L$_tr/lib")} \
+      -I"/usr/include/$(gcc -dumpmachine)" -I/usr/local/cuda/include \
       -L/usr/local/cuda/lib64 -lnvinfer -lnvinfer_plugin -lcudart -ldl -lpthread -o "$BIN" > "$OUT/compile.log" 2>&1 \
     || { echo "driver failed to compile - $OUT/compile.log"; exit 2; }
 fi
