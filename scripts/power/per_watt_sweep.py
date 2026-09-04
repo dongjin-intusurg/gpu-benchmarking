@@ -479,8 +479,10 @@ def main():
     sampler.join()
     with open(os.path.join(args.out, 'power_tops_sweep.json'), 'w') as handle:
         json.dump(out, handle, indent=1)
+    # the NVML sampler adds a column per clock-event reason it saw; the INA sampler adds none
+    columns = list(SAMPLE_COLUMNS) + [k for k in dict.fromkeys(k for row in sampler.rows for k in row) if k not in SAMPLE_COLUMNS]
     with open(os.path.join(args.out, 'power_samples.csv'), 'w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=SAMPLE_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(sampler.rows)
     write_points_csv(os.path.join(args.out, 'power_tops_points.csv'), out['precisions'])
