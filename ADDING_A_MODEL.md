@@ -77,6 +77,98 @@ And the plugin case — the depth variant carries a custom `.so`:
 MODEL_PLUGINS=${MODEL_ROOT}/depth_model/plugins/libdepth_plugins.so
 ```
 
+### 2b. Registration fields — how stage 4 builds and measures it
+
+The same manifest is also the model's **registration** for the per-model stage
+(`./scripts/run_model_solo.sh`). Everything below is optional: leaving all of
+it empty means "one TensorRT engine from `MODEL_ONNX` at `MODEL_PRECISION`,
+timed with `trtexec`". The template documents every field; the ones that
+change what gets built are:
+
+| Field | Meaning |
+|---|---|
+| `MODEL_BUILDERS` | `trt` (engine from ONNX), `adopt` (a repo-built engine, `MODEL_ENGINE`), `edgellm` (Jetson generative stack), `trtllm` (discrete generative stack). Comma-separated; **every entry becomes its own measured row**. `MODEL_BUILDERS_jetson` / `MODEL_BUILDERS_discrete` declare per platform from one manifest |
+| `MODEL_PRECISIONS` | every precision to build and measure; `MODEL_PRECISION` stays the primary (row `<name>`), the rest are rows `<name>_<prec>` |
+| `MODEL_ENGINE_SET` | a multi-graph model: `encoder,decoder_first,decoder_past` with `MODEL_ONNX_<member>`, `MODEL_BUILD_FLAGS_<member>`, `MODEL_RUN_FLAGS_<member>`, `MODEL_ARCH_GFLOPS_<member>`; every member is also timed on its own |
+| `MODEL_BUILD_ARGS` | build-only `trtexec` flags (shape profiles); they enter the build stamp but never a timing run |
+| `MODEL_ENGINE_DIR` | reuse a workspace that already holds valid artifacts (default `${ENGINE_ROOT}/<device_tag>/<name>`) |
+| `MODEL_E2E_SRC`, `MODEL_E2E_INPUTS`, `MODEL_E2E_ARGS`, `MODEL_E2E_REPEATS`, `MODEL_E2E_HZ`, `MODEL_E2E_DEADLINE_MS` | an end-to-end C++ driver over all the engines → row `<name>_e2e` (plus `<name>_decode` for a decode loop) |
+| `MODEL_CHECKPOINT`, `MODEL_LLM_*` | the generative fields: HF checkpoint dir, request battery / image, decode chunk, context and reuse lengths, extra build flags per precision |
+
+Rules that the validator enforces (all errors are reported at once, before any
+GPU work):
+
+- **Platform × builder is a hard error, never a warning.** Jetson accepts
+  `trt`, `adopt`, `edgellm`; a discrete card accepts `trt`, `adopt`, `trtllm`.
+  Register the other stack and the run stops at stage 4.0 naming the platform.
+- **Every referenced file must exist** — ONNX, checkpoint, calibration cache,
+  plugins, driver source, input list, `@file` flag files.
+- **A fallback needs a source.** An entry after a non-`trt` builder fires only
+  when the declared builder fails *and* `MODEL_ONNX` is set; the row then
+  records `builder_requested` vs `builder_used`.
+- **Quote values with spaces.** The manifest is sourced by bash under `set -e`,
+  so an unquoted `--a --b` fails registration instead of silently dropping
+  `--b`. Long shape profiles go in a file: `MODEL_BUILD_FLAGS_<member>=@${KIT_ROOT}/configs/shapes/<file>.flags`
+  (comment lines and line breaks are folded to spaces).
+- **A pre-existing engine is never rebuilt.** If `<engine_dir>/<name>_<prec>.engine`
+  already exists and is not something this kit built, it is load-gated at the
+  declared precision, recorded `adopted: true` with its sha256, and used as is.
+  Delete or relink the file to force a build. Generative workspaces are reused
+  the same way via their build stamp (a changed checkpoint, precision or build
+  flag changes the stamp and triggers a rebuild).
+
+The end-to-end driver contract, if you supply one (`scripts/model_bench/cpp/asr_e2e.cpp`
+is the reference implementation):
+
+```
+<bin> <engine_dir> <precision> <input_list> <out.jsonl> <repeats> 0 [MODEL_E2E_ARGS]
+```
+
+The driver loads `<engine_dir>/<member>_<precision>.engine` and writes one JSON
+line per request with `gpu_total_ms` (the latency of record), `ttft_ms`,
+`decode_ms_p99`, `wall_ms`, and optionally `encoder_ms`, `n_tokens`, `seconds`,
+`rtf_wall`. It is compiled by the stage with the same `g++ … -lnvinfer
+-lnvinfer_plugin -lcudart` line `setup.sh` uses.
+
+Two more worked examples. A three-graph ASR model with its end-to-end driver:
+
+```bash
+MODEL_NAME=asr
+MODEL_PRECISION=fp16
+MODEL_ENGINE_SET=encoder,decoder_first,decoder_past
+MODEL_ONNX_encoder=${ONNX_DIR}/asr/encoder_model.onnx
+MODEL_ONNX_decoder_first=${ONNX_DIR}/asr/decoder_model.onnx
+MODEL_ONNX_decoder_past=${ONNX_DIR}/asr/decoder_with_past_model.onnx
+MODEL_BUILD_FLAGS_encoder=--shapes=input_features:1x128x3000
+MODEL_BUILD_FLAGS_decoder_first=@${KIT_ROOT}/configs/shapes/asr_decoder_first.flags
+MODEL_BUILD_FLAGS_decoder_past=@${KIT_ROOT}/configs/shapes/asr_decoder_past.flags
+MODEL_ARCH_GFLOPS_encoder=2273.77
+MODEL_HZ=20
+MODEL_DEADLINE_MS=50
+MODEL_E2E_SRC=${KIT_ROOT}/scripts/model_bench/cpp/asr_e2e.cpp
+MODEL_E2E_INPUTS=${INPUTS_ROOT}/asr/mel_bin/list.txt
+MODEL_E2E_REPEATS=3
+MODEL_E2E_HZ=0
+MODEL_E2E_DEADLINE_MS=50
+```
+
+A VLM measured on both platforms from one manifest, two precisions each:
+
+```bash
+MODEL_NAME=vlm_27b
+MODEL_CHECKPOINT=${MODEL_ROOT}/checkpoints/vlm-27b
+MODEL_BUILDERS_jetson=edgellm
+MODEL_BUILDERS_discrete=trtllm
+MODEL_PRECISION=fp8
+MODEL_PRECISIONS=fp8,nvfp4
+MODEL_ENGINE_DIR=${LLM_WORKSPACE}/vlm-27b
+MODEL_LLM_BATTERY=${INPUTS_ROOT}/vlm/battery.json
+MODEL_LLM_IMAGE=${INPUTS_ROOT}/vlm/sample.jpeg
+MODEL_LLM_CHUNK=8
+MODEL_HZ=10
+MODEL_DEADLINE_MS=100
+```
+
 ## 3. `configs/manifests/acc_manifest_<name>.json`
 
 Tensor-level truth for the accuracy gate. This is the part that cannot be
@@ -128,16 +220,40 @@ the frozen mix definition, not from what the model happens to achieve.
 ## 5. Run it
 
 ```bash
-./setup.sh                                   # links assets, expands paths, verifies every row resolves
-MODEL_MANIFEST=configs/manifests/model_manifest_<name>.env ./scripts/run_model_bench.sh
+./setup.sh                          # links assets, expands paths, verifies every row resolves
+./scripts/run_model_solo.sh --list  # what is registered and what it would build — no GPU
+./scripts/run_model_solo.sh         # validate -> build (unlocked) -> measure (locked) -> N, every model
 ```
+
+`./scripts/run_model_solo.sh --only <name>` runs one model (repeatable);
+`--skip-build` measures artifacts that are already built. There are no other
+arguments: device config, ceilings run, registry and workspaces are discovered
+from the machine through the `env.sh` path contract. `sudo -v` first — the
+measure step pins the clocks and refuses to run if it cannot.
 
 `setup.sh` step 6 tells you before you start whether every path resolves —
 use it as the check that you filled the manifest correctly, rather than
 discovering a typo forty minutes into an engine build.
 
-The pipeline then runs: engines → accuracy gate → causal dial → measure → package,
-writing to `results_<device>_<model_name>/`.
+The stage then runs, for every registered model × builder × precision:
+
+1. **validate** (`model_bench/validate_registry.sh`) — every registration
+   error at once, no GPU.
+2. **build** (`model_bench/build_models.sh`) — unlocked, since builds are not
+   timed; every artifact is validated (engine deserialize + realized-precision
+   census + sha256, or checkpoint presence for a serving stack) and the row
+   set is written to `${ENGINE_ROOT}/<device_tag>/registry_rows/`.
+3. **measure** (`model_bench/measure_models.sh`) — one verified clock lock for
+   the whole run, released on exit. Engine rows: 1000-iteration `trtexec` p99,
+   nsys timeline, NCU bytes, VRAM. End-to-end rows: the driver over the whole
+   engine set. Generative rows: TTFT, decode tokens/s and the control step
+   (visual + prefill + chunk × decode). Every row then goes through the same
+   scorer (`model_bench/compute_budgets.py`): budgets, U_max, C, L,
+   N = min(L, C), cause tag, Score.
+
+Output lands in `results/solo_<device_tag>_<stamp>/` — `results.json` (one
+row per measured configuration), `report.md`, `provenance/`, and the per-row
+`engine_rows/`, `e2e/`, `generative/` directories with the raw logs.
 
 ## 6. What to check before believing the numbers
 

@@ -41,6 +41,9 @@ export LLM_WORKSPACE="${LLM_WORKSPACE:-$WORK_ROOT/llm-workspace}"      # quantiz
 export BENCH_ENV_SH="${BENCH_ENV_SH:-}"          # a file to source first (sets LD_LIBRARY_PATH etc.)
 [ -z "$BENCH_ENV_SH" ] && [ -r "$KIT_ROOT/.bench_env.sh" ] && export BENCH_ENV_SH="$KIT_ROOT/.bench_env.sh"
 export BENCH_PY="${BENCH_PY:-}"                  # the interpreter that has the runtime
+# the Edge-LLM python frontend (tensorrt_edgellm.scripts.quantize/export), when
+# installed with pip --target rather than into the system site-packages
+export EDGELLM_PYLIB="${EDGELLM_PYLIB:-$HOME/tools/edgellm-pylib}"
 if [ "$PLATFORM" = discrete ]; then
   # TensorRT-LLM is normally installed into its own venv rather than against the
   # system interpreter; BENCH_ENV_SH / BENCH_PY are how the stages reach it.

@@ -20,8 +20,10 @@ gpu-benchmarking/
   setup.sh            symlinks, helper builds, resolve check (available)
   scripts/            measurement code, one directory per stage:
     device_ceilings/  §3 device ceilings                             (available)
-    model_bench/      §4a engine-path per-model    (C++ row loop available; stage pending)
-    serving/          §4b serving-runtime per-model                        (pending)
+    run_model_solo.sh §4 per-model entry point                          (available)
+    model_bench/      §4 per-model: registry, build, measure, scorer      (available)
+      cpp/            the C++ row loop and the end-to-end ASR driver
+      trtllm/         the discrete generative stack helpers (TensorRT-LLM)
     colocation/       §5 co-location and paced runs                        (pending)
     power/            §6 power sweeps                                       (pending)
     figures/          §7 figures and reports                               (pending)
@@ -235,31 +237,54 @@ measures next. Release by hand: Jetson `sudo jetson_clocks --restore
 <run>/provenance/jetson_clocks_saved.conf` (or reboot); discrete `sudo nvidia-smi
 -rgc -rmc`. Normal exit, `set -e`, and Ctrl-C are covered by the trap.
 
-## 4. Per-model measurement _(pending)_
+## 4. Per-model measurement (available)
 
-**One stage, two harnesses — every model in the mix gets a solo measurement
-here, whichever harness produces it.** The number that comes out is the same in
-both cases: budgets per device (time, bandwidth, VRAM), U_max, C = 1/U_max,
-L = deadline / p99, **N = min(L, C)**, and Score = N × Σ(arch GFLOPs × Hz), with
-a cause tag (throughput- vs latency-limited). What differs is only how the
-engine is built and how latency and fidelity are measured. A manifest field
-(`MODEL_KIND`) selects the harness, and a coverage check reports any mix row
-that has no result yet — "every model covered" is a stage output, not a claim.
+```bash
+sudo -v                                  # the measure step pins the clocks; it refuses without root
+./scripts/run_model_solo.sh --list       # what is registered and what it would build — no GPU
+./scripts/run_model_solo.sh              # validate -> build -> measure -> N, every registered model
+./scripts/run_model_solo.sh --only <m>   # one model (repeatable);  --skip-build: artifacts exist
+```
 
-**§4a — engine path** (vision, depth, detection). One ONNX builds both the
-quantized candidate and an fp32 reference; the accuracy gate requires ≥99%
-per-tensor agreement between them on real sample inputs; latency is a
-1000-iteration frame p99; bytes/frame come from the causal memory-clock dial;
-an NCU pass gives the roofline bound percentages.
+**One stage, every runtime — every registered model gets a solo measurement
+here, and the number that comes out is the same whichever harness produces it:**
+budgets per device (time, bandwidth, VRAM), U_max, C = 1/U_max,
+L = deadline / p99, **N = min(L, C)**, Score = N × Σ(arch GFLOPs × Hz), with a
+cause tag (throughput- vs latency-limited). A model is **registered once** in
+its manifest (`ADDING_A_MODEL.md` §2b) with its sources, precisions and
+builders; the stage builds every declared configuration and measures each as
+its own row.
 
-**§4b — serving-runtime path** (LLM / VLM / ASR). The quantized checkpoint is
-exported to the serving runtime — TensorRT Edge-LLM on Jetson, TensorRT-LLM on
-a discrete card — as several engines (vision encoder, decoder). Latency is
-time-to-first-token plus decode tokens/s (streaming end-to-end for ASR), and the
-fidelity gate is teacher-forced agreement against the unquantized model, since
-no fp32 reference *engine* exists. Demand has two regimes per model: decode is
-bytes-bound, prefill is compute-bound — both are measured and the deadline
-decides which governs.
+- **validate** (`model_bench/validate_registry.sh`) — no GPU; every
+  registration error reported at once. The platform × builder rule is a hard
+  error: Jetson takes `trt` / `adopt` / `edgellm`, a discrete card takes
+  `trt` / `adopt` / `trtllm`.
+- **build** (`model_bench/build_models.sh`) — **unlocked**, because builds are
+  not timed. TensorRT engines from ONNX (single or a multi-graph engine set),
+  adopted repo-built engines, Edge-LLM (Jetson) or TensorRT-LLM (discrete)
+  quantize → export → build for generative models. Every artifact is validated
+  before it can be measured; an artifact that already exists and stamps clean is
+  reused, never rebuilt.
+- **measure** (`model_bench/measure_models.sh`) — **one verified clock lock for
+  the whole run**, released on exit. Engine rows: 1000-iteration `trtexec` p99,
+  nsys timeline, NCU byte counters, VRAM sample. End-to-end rows: the model's
+  own C++ driver over its whole engine set (streaming ASR: TTFT, decode-step
+  p99, real-time factor). Generative rows: vision encoder, prefill, KV-reuse
+  prefill, decode tokens/s, and the control step the deadline judges
+  (visual + prefill + chunk × decode). All rows then go through the one scorer,
+  `model_bench/compute_budgets.py`.
+
+The scorer is deliberately the only place the N formula lives. A row with no
+byte measurement is marked `budgets_not_measured` rather than scored as free on
+the bandwidth axis; a row measured at 0 Hz (a request-driven model) is scored
+against its deadline alone. The ceilings the budgets divide by come from the
+newest §3 run on the machine — never re-measured here, never typed in.
+
+Output: `results/solo_<device_tag>_<stamp>/` with `results.json` (one row per
+measured configuration, carrying builder, precision, adopted / pre-existing
+provenance, latency, bytes, VRAM and the solo block), `report.md`, the
+provenance set (preflight, lock verification, saved clock state, drift), and the
+raw per-row logs under `engine_rows/`, `e2e/`, `generative/`.
 
 ## 5. Co-location and paced runs _(pending)_
 
