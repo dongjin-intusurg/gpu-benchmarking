@@ -125,6 +125,13 @@ def cmd_e2e(a):
     print(f"  {rows[1]['name']:26} decode step p99 {rows[1]['latency_ms']:.3f} ms  at {rows[1]['hz']} tok/s")
 
 
+# Spec rate for the generative rows is not fixed yet: MODEL_HZ is a placeholder.
+# Every generative / e2e row therefore also carries N at this rate grid plus the
+# highest rate the row sustains solo at N >= 1, so the verdict can be read off
+# once the rate is decided (compute_budgets.py scores the grid).
+HZ_GRID = [1, 2, 5, 10, 20, 30]
+
+
 # -------------------------------------------------------------------- edgellm
 def bench_ms(path):
     try:
@@ -160,12 +167,17 @@ def cmd_edgellm(a):
                 'tokens_per_second': gen.get('tokens_per_second'), 'generated_tokens': gen.get('generated_tokens'),
                 'prefill_ms_median': stages.get('llm_prefill', {}).get('median_ms'),
                 'visual_ms_median': stages.get('vision_encoder', {}).get('median_ms'),
-                'peak_unified_memory_mb': p.get('peak_unified_memory_mb'), 'profile': a.profile}
+                'peak_unified_memory_mb': p.get('peak_unified_memory_mb'), 'profile': a.profile, 'stages': stages}
         if p.get('peak_unified_memory_mb'):
             vram = max(vram or 0, p['peak_unified_memory_mb']); vsrc = 'edgellm-profile-peak-unified'
     eb = float(r.get('engine_bytes') or 0) / 1e6; vb = float(r.get('visual_bytes') or 0) / 1e6
     bytes_mb = eb * (chunk + 1) + vb if eb else None
-    row = {'name': r['row'], 'kind': 'generative', 'runtime': 'edgellm', 'precision': r['precision'],
+    # a resident engine can never occupy less than its own bytes: when the
+    # battery did not run (sampler saw a process that died early) the sampled
+    # delta is meaningless, so the weights are the floor of record
+    if eb and (vram or 0) < eb + vb:
+        vram, vsrc = round(eb + vb, 1), 'engine-bytes-floor (llm + visual engine files; battery peak unavailable)'
+    row = {'name': r['row'], 'kind': 'generative', 'runtime': 'edgellm', 'precision': r['precision'], 'hz_grid': HZ_GRID,
            'latency_ms': round(step, 3), 'latency_source': f'llm_bench step = visual + best(prefill,reuse) + {chunk} x decode',
            'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
            'bytes_per_frame_MB': round(bytes_mb, 1) if bytes_mb else None,
@@ -176,9 +188,37 @@ def cmd_edgellm(a):
                           'context_len': r.get('context_len'), 'reuse_len': r.get('reuse_len'),
                           'ttft_ms_bench': round((vis or 0) + best_pre + dec, 2),
                           'engine_mb': round(eb, 1), 'visual_mb': round(vb, 1), 'e2e': prof}}
-    json.dump([row], open(a.out, 'w'), indent=1)
+    rows = [row]
+    if prof and prof.get('decode_ms_p99'):
+        # end-to-end rows from the llm_inference battery (real prompts + image,
+        # the runtime's own stage timers): the chunk step at p99 of every stage,
+        # and the decode loop the per-token deadline judges - the same pair the
+        # C++ driver rows produce for the ASR model
+        st = prof['stages']
+        p99 = lambda k: float(st.get(k, {}).get('p99_ms') or 0)
+        step_e2e = p99('vision_encoder') + p99('llm_prefill') + chunk * p99('llm_generation')
+        rows.append({'name': f"{r['row']}_e2e", 'kind': 'e2e', 'runtime': 'edgellm-llm_inference', 'precision': r['precision'],
+                     'latency_ms': round(step_e2e, 3),
+                     'latency_source': f'llm_inference battery step = vision p99 + prefill p99 + {chunk} x decode p99 (stage timers)',
+                     'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
+                     'hz_grid': HZ_GRID, 'bytes_per_frame_MB': row['bytes_per_frame_MB'], 'bytes_source': row['bytes_source'],
+                     'vram_mb': vram, 'vram_source': vsrc,
+                     'e2e': dict(prof, chunk=chunk, step_ms_p99=round(step_e2e, 3), battery=r.get('battery'), image=r.get('image'))})
+        rows.append({'name': f"{r['row']}_decode", 'kind': 'e2e', 'runtime': 'edgellm-llm_inference', 'precision': r['precision'],
+                     'latency_ms': round(prof['decode_ms_p99'], 3), 'latency_source': 'llm_inference battery decode step p99',
+                     # modal: the decode loop runs at its own token rate, not the frame rate
+                     'hz': round(float(prof.get('tokens_per_second') or 0), 3), 'deadline_ms': float(r['deadline_ms']),
+                     'arch_gflops': 0.0, 'hz_grid': HZ_GRID,
+                     'bytes_per_frame_MB': round(eb, 1) if eb else None,
+                     'bytes_source': 'weights-stream-estimate: llm engine bytes per token (KV traffic excluded - a lower bound)',
+                     'vram_mb': vram, 'vram_source': vsrc,
+                     'e2e': {'decode_ms_median': prof.get('decode_ms_median'), 'decode_ms_p99': prof['decode_ms_p99'],
+                             'tokens_per_second': prof.get('tokens_per_second'), 'ttft_ms': prof['ttft_ms']}})
+    json.dump(rows, open(a.out, 'w'), indent=1)
     print(f"  {row['name']:26} step {step:.1f} ms (vis {vis} + prefill {pre}/{reuse} + {chunk}x{dec})  "
           f"tok/s {1000/dec:.1f}" + (f"  e2e ttft {prof['ttft_ms']:.1f} tok/s {prof['tokens_per_second']:.1f}" if prof else ''))
+    if len(rows) > 1:
+        print(f"  {rows[1]['name']:26} e2e step p99 {rows[1]['latency_ms']:.1f} ms   {rows[2]['name']:26} decode p99 {rows[2]['latency_ms']:.2f} ms at {rows[2]['hz']} tok/s")
 
 
 # --------------------------------------------------------------------- trtllm
@@ -192,7 +232,7 @@ def cmd_trtllm(a):
         sys.exit(f'{a.sweep}: no chunk-{chunk} pass with total_ms_p99')
     vram, vsrc = read_vram(a.vram)
     eb = float(r.get('engine_bytes') or 0) / 1e6
-    row = {'name': r['row'], 'kind': 'generative', 'runtime': 'trtllm', 'precision': r['precision'],
+    row = {'name': r['row'], 'kind': 'generative', 'runtime': 'trtllm', 'precision': r['precision'], 'hz_grid': HZ_GRID,
            'latency_ms': c['total_ms_p99'], 'latency_source': f'RequestPerfMetrics total_ms p99, chunk {chunk} (reuse on)',
            'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
            'bytes_per_frame_MB': round(eb * (int(chunk) + 1), 1) if eb else None,
@@ -273,7 +313,20 @@ def cmd_merge(a):
             L.append(f"| {r['name']} | {r.get('runtime')} | {r.get('precision')} | {g.get('visual_ms')} | {g.get('prefill_ms') or g.get('prefill_cold_ms')} | "
                      f"{g.get('prefill_reuse_ms')} | {g.get('decode_ms')} | {g.get('tokens_per_s_bench')} | {g.get('ttft_ms_bench') or g.get('ttft_ms')} | "
                      f"{e.get('ttft_ms')} | {e.get('tokens_per_second')} | {e.get('decode_ms_p99')} | {r.get('vram_mb')} |")
-    e2e = [r for r in rows if r.get('kind') == 'e2e' and r['name'].endswith('_e2e')]
+    sweep = [r for r in rows if (r.get('solo') or {}).get('N_vs_hz')]
+    if sweep:
+        grid = list(sweep[0]['solo']['N_vs_hz'].keys())
+        L += ['', '## Rate sweep - generative and e2e rows (spec rate not fixed: MODEL_HZ is a placeholder)', '',
+              'N at each candidate rate with the period (1000/rate) as the deadline and the same measured budgets; '
+              '**max rate @ N>=1** = the highest solo rate the row sustains, and which budget binds there. '
+              'Rates are Hz for step rows and tokens/s for decode rows. Read the verdict off the column once the rate is decided.', '',
+              '| row | latency ms | ' + ' | '.join(f'N@{h}' for h in grid) + ' | max rate @ N>=1 | binds at max |',
+              '|---|---:|' + '---:|' * len(grid) + '---:|---|']
+        for r in sweep:
+            s = r['solo']
+            L.append(f"| {r['name']} | {r['latency_ms']:.1f} | " + ' | '.join(str(s['N_vs_hz'][h]) for h in grid) +
+                     f" | {s.get('max_hz_at_N1')} | {s.get('max_hz_bound_by')} |")
+    e2e = [r for r in rows if r.get('kind') == 'e2e' and r['name'].endswith('_e2e') and 'clips' in (r.get('e2e') or {})]
     if e2e:
         L += ['', '## End-to-end driver rows', '',
               '| row | clips x repeats | encoder ms | first step ms | TTFT ms | decode ms median / p99 max | gpu total median / p99 | RTF | speech tok/s |',

@@ -227,13 +227,29 @@ if [ -n "$GEN_ROWS" ]; then
         ( cd "$EDGELLM_ROOT" && "$BENCH" --engineDir "$LLM_DIR" --mode decode --pastKVLen "$CONTEXT_LEN" ) > "$D/decode.log" 2>&1
         PROFILE=""
         if [ -n "${BATTERY:-}" ] && [ -f "$BATTERY" ] && [ -x "$INFER" ]; then
-          say "  llm_inference battery $(basename "$BATTERY") (context reuse on)"
-          # hybrid models refuse context reuse without the snapshot pools
+          # hybrid models refuse context reuse without the snapshot pools, and the
+          # runtime sizes the pool in whole slots: slot = linear-attention layers x
+          # (recurrent state + conv state). A fixed 64 MiB is one slot for a 4B-class
+          # model and ZERO for a 27B-class one (~148 MiB/slot) -> "requires at least
+          # one recurrent snapshot slot". Size it from the engine config: one slot,
+          # never below 64 MiB, so every model runs with the same one-slot policy.
+          SNAP=$(python3 - "$LLM_DIR/config.json" <<'PYSNAP'
+import json, sys
+c = json.load(open(sys.argv[1]))
+n = int(c.get('num_linear_attn_layers') or 0)
+rec = (int(c.get('recurrent_state_num_heads') or 0) * int(c.get('recurrent_state_head_dim') or 0)
+       * int(c.get('recurrent_state_size') or 0) * (4 if c.get('recurrent_state_dtype', 'fp32') == 'fp32' else 2))
+conv = int(c.get('conv_dim') or 0) * int(c.get('conv_kernel') or 0) * (4 if c.get('conv_state_dtype') == 'fp32' else 2)
+slot = n * (rec + conv)
+print(max(64 << 20, (-(-slot // (1 << 20))) << 20))
+PYSNAP
+)
+          say "  llm_inference battery $(basename "$BATTERY") (context reuse on; recurrent snapshot pool $((SNAP >> 20)) MiB = one slot)"
           ( cd "$EDGELLM_ROOT" && sampled "$D/vram.json" "$D/e2e.log" "$INFER" \
               --engineDir "$LLM_DIR" ${VISUAL_DIR:+--multimodalEngineDir "$(dirname "$VISUAL_DIR")"} \
               --inputFile "$BATTERY" --outputFile "$D/e2e_out.json" \
               --dumpProfile --profileOutputFile "$D/e2e_profile.json" \
-              --enableContextReuse --contextCacheRecurrentSnapshotPoolBytes 67108864 \
+              --enableContextReuse --contextCacheRecurrentSnapshotPoolBytes "$SNAP" \
               --contextCachePartialKVSnapshotPoolBytes 67108864 ) \
             && PROFILE="$D/e2e_profile.json" \
             || { tail -8 "$D/e2e.log" | tee -a "$LOG"; say "  $ROW: llm_inference failed - bench numbers only"; }

@@ -150,6 +150,32 @@ def score_row(row, bw_eff, vram_cap):
         row['solo']['budgets_not_measured'] = incomplete
         row['solo']['caveat'] = ('U_max is a LOWER bound: ' + ', '.join(incomplete) +
                                  ' not measured, so the true binding budget may be higher and N lower')
+    grid = row.get('hz_grid')
+    if grid:
+        # the spec rate (and with it the deadline) is undecided for this row:
+        # score the same budgets at each candidate rate with the period as the
+        # deadline (time and bandwidth scale with hz, VRAM does not) and report
+        # the highest rate that still yields N >= 1. The declared hz/deadline
+        # placeholders govern the headline N above, not this sweep.
+        nv = {}
+        for h in grid:
+            bh = {'time_occupancy': lat / 1e3 * h}
+            if bytes_mb is not None and bw_eff:
+                bh['dram_bandwidth'] = bytes_mb / 1e3 * h / bw_eff
+            if vram and vram_cap:
+                bh['vram_footprint'] = float(vram) / vram_cap
+            umh = max(bh.values())
+            nv[str(h)] = round(min((1e3 / h) / lat, 1.0 / umh), 3) if umh > 0 else None
+        row['solo']['N_vs_hz'] = nv
+        row['solo']['N_vs_hz_deadline'] = 'period (1000/hz ms)'
+        if vram and vram_cap and float(vram) / vram_cap >= 1:
+            row['solo']['max_hz_at_N1'], row['solo']['max_hz_bound_by'] = 0.0, 'vram'
+        else:
+            cands = {'time': 1e3 / lat}
+            if bytes_mb is not None and bw_eff:
+                cands['dram_bandwidth'] = bw_eff * 1e3 / bytes_mb
+            k = min(cands, key=cands.get)
+            row['solo']['max_hz_at_N1'], row['solo']['max_hz_bound_by'] = round(cands[k], 2), k
     if hz == 0:
         row['solo']['score_tflops'] = None
         row['solo']['modal'] = ('hz=0: no sustained time/bandwidth bill; N is the verdict '
