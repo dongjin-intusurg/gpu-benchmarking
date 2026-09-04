@@ -302,3 +302,31 @@ discrete: plain, mps, streams, mig).
 run flags, stage-4 solo p99 per row) and the arm set; `--mix <m>` limits a run
 to one mix. The engines a mix uses are the stage-4 artifacts — nothing is built
 here, and a row whose engine is missing fails validation rather than the run.
+
+## 8. Registering an operating point — `configs/power/points_<platform>.csv`
+
+Stage 6 repeats stage 5 at every operating point in the platform's point
+table. Add a row; nothing else changes.
+
+```
+point,knob,value,default,gated,note
+MAXN,nvpmodel,0,1,0,baseline: the mode the device config requires
+120W,nvpmodel,1,1,0,GPU clock cap lowered (EMC unchanged); no gating
+90W,nvpmodel,2,0,1,TPC gating mask; takes effect at boot - run last, reboot after
+```
+
+| column | meaning |
+|---|---|
+| `point` | the name the knob's read-back must report: Jetson — the mode NAME in `nvpmodel -q` (`NV Power Mode: <name>`); discrete — `<watts>W` for a `pl` row, `lgc<MHz>` for an `lgc` row. The run fails the point when the read-back disagrees |
+| `knob` | `nvpmodel` (Jetson mode id), `pl` (`nvidia-smi -pl`, watts), `lgc` (`nvidia-smi -lgc`, MHz cap held for the point) |
+| `value` | the argument to the knob |
+| `default` | `1` = measured by a run without `--point`; the FIRST default row is the baseline every ratio is taken against — keep it the device's default operating point |
+| `gated` | `1` = the point changes the hardware configuration beyond clocks and needs a reboot to take effect (Jetson modes with a GPU gating mask). Gated points run last; after one has been applied the kit refuses ungated points until the next boot |
+
+Rules: names unique; every column present; a `pl` value outside the card's
+`power.min_limit`–`power.max_limit` is skipped (status SKIPPED), not failed; a
+`lgc` value above `clocks.max.graphics` likewise. `./scripts/run_power.sh
+--list` prints the resolved table, the baseline, and the mixes and arms each
+point will run. The mixes come from stage 5's registry
+(`configs/colocation/*.csv`): by default the ones without side rows; `--mix`
+selects any registered mix.

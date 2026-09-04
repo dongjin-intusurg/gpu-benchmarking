@@ -1,0 +1,14 @@
+# Stage-6 operating points for a discrete card. The default sweep is the two
+# enforced power limits 300 W (the card's default limit, the baseline) and 250 W.
+#   knob  pl    value = enforced board power limit in W (nvidia-smi -pl); the point
+#               NAME must be "<value>W" (the read-back check compares them). A value
+#               below power.min_limit or above power.max_limit is skipped and recorded.
+#   knob  lgc   value = an SM clock cap in MHz at the default power limit: an
+#               emulated lower-power point (a recipe), not an enforced cap; point
+#               name "lgc<value>". Not in the default sweep - select with --point.
+#   default 1 = in the default sweep; gated is always 0 on a discrete card
+point,knob,value,default,gated,note
+300W,pl,300,1,0,baseline: the default power limit
+250W,pl,250,1,0,enforced board cap
+lgc1500,lgc,1500,0,0,SM clock-cap recipe at the default limit
+lgc1200,lgc,1200,0,0,SM clock-cap recipe at the default limit

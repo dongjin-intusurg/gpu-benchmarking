@@ -5,34 +5,171 @@ modules and discrete cards — by measurement rather than datasheet. Every capac
 question is answered as demand / capacity, where both sides are measured on the
 device under a locked, exclusive, provenance-stamped regime.
 
-Contents are being added in validated stages. Sections marked _(pending)_ describe
-what will land there; the scripts are not in this repository yet.
+## Quick start — stage 0 to 6 on one machine
+
+The same commands run on a Jetson module and on a discrete card; the scripts
+detect the platform and pick the matching pieces (power tools, serving stack,
+clock knobs). Every stage ends in a `report.md` (stages 4–6 under
+`results/<stage>_<device_tag>_<stamp>/`) — that file is the deliverable of the
+stage. §0–§7 below explain each stage in depth; this is the shortest path
+through them.
+
+**Before any measurement stage (3, 4, 5, 6):** work from ssh, take the desktop
+down, and prime sudo — the clock lock needs root and the preflight refuses to
+run with a display session or a foreign GPU client alive.
+
+```bash
+sudo systemctl isolate multi-user.target   # headless; ssh sessions survive (graphical.target brings the desktop back)
+sudo -v                                    # keep it primed for long runs
+```
+
+### Step 0 — prerequisites
+
+```bash
+git clone <this repo> && cd gpu-benchmarking
+./prereqs.sh                       # report what is missing
+./prereqs.sh --install --tier all  # apt + pip + the serving runtime (Edge-LLM on Jetson, TensorRT-LLM on discrete)
+```
+
+`--tier measure` (the default) is enough for stages 3–6 with TensorRT engines
+only; `--tier all` adds the generative stack.
+
+### Step 1 — put the model assets in one place
+
+```bash
+mkdir -p ~/models            # or anywhere: export MODEL_ROOT=/path/to/models
+# ~/models/<model>/{onnx,calib,samples,plugins}   one directory per model (copies or symlinks)
+. ./env.sh && ./configure.sh # expand the config templates for this host; lists any unresolved path
+```
+
+### Step 2 — machine setup
+
+```bash
+./setup.sh --model-root $MODEL_ROOT --search $MODEL_ROOT   # symlinks, helper builds, resolve check
+. ./.setup_env                                             # every later shell needs only this line
+```
+
+### Step 3 — device ceilings (the capacity side; once per device)
+
+```bash
+./scripts/device_ceilings/run_device_ceilings.sh
+./scripts/device_ceilings/validate_ceilings.py scripts/results_<device_tag>_ceilings --device configs/device_configs/<device>.json
+```
+
+About 30–60 minutes; the run lands in `scripts/results_<device_tag>_ceilings/`
+(`ceilings_report.txt` is the readable summary) and every later stage discovers
+it by itself. `CEIL_SMOKE=1 ./scripts/device_ceilings/run_device_ceilings.sh` is
+a 2-minute rehearsal.
+
+### Step 4 — add a model and measure it solo (the demand side)
+
+1. **Describe the model** (`ADDING_A_MODEL.md` §1–§4, ~15 minutes):
+   - copy `configs/manifests/model_manifest.env.template` to
+     `configs/manifests/model_manifest_<name>.env`; fill `MODEL_NAME`,
+     `MODEL_ONNX`, `MODEL_PRECISION`, `MODEL_HZ`, `MODEL_DEADLINE_MS`, the
+     calibration cache / plugins / shapes if the model has them — always through
+     `${MODEL_ROOT}`;
+   - write `configs/manifests/acc_manifest_<name>.json` (which outputs the
+     accuracy gate compares, where the sample inputs are);
+   - choose **how it is built** with `MODEL_BUILDERS` (§2b):
+     `trt` — a TensorRT engine from the ONNX (default);
+     `adopt` — an engine you already built (`MODEL_ENGINE`);
+     `edgellm` — a generative model served by TensorRT Edge-LLM (Jetson);
+     `trtllm` — the same on a discrete card by TensorRT-LLM;
+     `MODEL_BUILDERS_jetson=edgellm` / `MODEL_BUILDERS_discrete=trtllm` declare both from one manifest.
+     Generative models add `MODEL_CHECKPOINT` and the `MODEL_LLM_*` fields;
+     multi-graph models add `MODEL_ENGINE_SET` (and optionally an end-to-end
+     driver, `MODEL_E2E_SRC`).
+2. **Register and check** — no GPU:
+   ```bash
+   ./configure.sh && ./setup.sh --model-root $MODEL_ROOT   # expand the new manifest, verify every path resolves
+   ./scripts/run_model_solo.sh --list                     # what is registered and what it would build
+   ```
+3. **Build and measure:**
+   ```bash
+   ./scripts/run_model_solo.sh                   # validate -> build (unlocked) -> measure (locked) -> N, every model
+   ./scripts/run_model_solo.sh --only <name>     # one model;  --skip-build: artifacts already built
+   ```
+   Engines build for minutes to an hour (generative quantization longer); the
+   measure step is ~10–50 minutes per model (NCU dominates).
+4. **Read** `results/solo_<device_tag>_<stamp>/report.md` — one row per
+   model × builder × precision with p99, bytes/frame, VRAM, the budgets,
+   U_max, C, L, **N = min(L, C)** and the cause tag; `results.json` carries
+   the same rows for the next stages. Check the validity list in
+   `ADDING_A_MODEL.md` §6 before believing a number.
+
+### Step 5 — co-locate: register a mix and run it
+
+1. **Register a mix** (`ADDING_A_MODEL.md` §7): copy
+   `configs/colocation/template.csv` to `configs/colocation/<mix>.csv` — one
+   line per stage-4 row: `role` `frame` (paced at `hz`) or `side` (ASR /
+   generative, run by its own runtime), `deadline_ms`, an optional stream
+   priority (`prio`) and MPS thread cap (`mps_pct`).
+2. **Check** — no GPU:
+   ```bash
+   ./scripts/run_colocation.sh --list            # mixes, resolved rows, arms this platform supports
+   ```
+3. **Run:**
+   ```bash
+   ./scripts/run_colocation.sh                   # every mix x arm (plain / mps / streams / mig)
+   ./scripts/run_colocation.sh --mix <mix> --arm plain   # one cell;  --skip-solo: reuse the paced solos
+   ```
+   ~90 s per paced solo and per arm (`RUN_SECONDS`); a mix of three rows
+   under four arms is ~15 minutes.
+4. **Read** `results/coloc_<device_tag>_<stamp>/report.md`: the mix × arm
+   matrix (fits / makespan p99 / N measured vs predicted / worst row) and a
+   per-row table per cell.
+
+### Step 6 — power: register an operating point and repeat stage 5 there
+
+1. **Register a point** (`ADDING_A_MODEL.md` §8) in
+   `configs/power/points_jetson.csv` (`nvpmodel` modes) or
+   `configs/power/points_discrete.csv` (`pl` watts, `lgc` MHz). The shipped
+   tables already hold the baseline and one lower point per platform.
+2. **Check** — no GPU:
+   ```bash
+   ./scripts/run_power.sh --list                 # points, mixes and arms per point, sweep args
+   ```
+3. **Run:**
+   ```bash
+   ./scripts/run_power.sh                        # every default point: knob -> lock -> stage-5 matrix -> per-watt sweep
+   ./scripts/run_power.sh --point <p> --mix <m>  # one point, one mix
+   ```
+   Roughly the stage-5 time per point plus ~10 minutes of sweeps. A gated
+   point (one that needs a reboot) runs last and tells you when to reboot.
+4. **Read** `results/power_<device_tag>_<stamp>/report.md`: per point the
+   paced-solo p99 / J per frame, the co-location cells and the per-watt
+   ceilings, each as a ratio to the baseline point.
+
+### Step 7 — figures and reports
+
+Not in this repository yet; this guide grows by one step when it lands.
 
 ## Layout
 
 ```
 gpu-benchmarking/
-  prereqs.sh          check / install prerequisites          (available)
-  env.sh              root variables every script reads      (available)
-  configure.sh        expand config templates for this host  (available)
-  configs/            mix / manifest / device-config / co-location templates (available)
-  ADDING_A_MODEL.md   how to describe a new model            (available)
-  setup.sh            symlinks, helper builds, resolve check (available)
+  prereqs.sh          check / install prerequisites
+  env.sh              root variables every script reads
+  configure.sh        expand config templates for this host
+  configs/            mix / manifest / device-config / co-location / power-point tables
+  ADDING_A_MODEL.md   how to describe a new model
+  setup.sh            symlinks, helper builds, resolve check
   scripts/            measurement code, one directory per stage:
-    device_ceilings/  §3 device ceilings                             (available)
-    run_model_solo.sh §4 per-model entry point                          (available)
-    model_bench/      §4 per-model: registry, build, measure, scorer      (available)
+    device_ceilings/  §3 device ceilings
+    run_model_solo.sh §4 per-model entry point
+    model_bench/      §4 per-model: registry, build, measure, scorer
       cpp/            the C++ row loop and the end-to-end ASR driver
       trtllm/         the discrete generative stack helpers (TensorRT-LLM)
-    colocation/       §5 co-location: mixes, compose, arms, verdict         (available)
+    colocation/       §5 co-location: mixes, compose, arms, verdict
       arms/           one script per arm (plain, mps, streams, mig)
-    power/            §6 power sweeps                                       (pending)
-    figures/          §7 figures and reports                               (pending)
-  results/            small, reviewable result files                       (pending)
-  figs/               figures regenerated from results/                    (pending)
+    power/            §6 power: points, knobs, per-watt sweeps, verdict
+    figures/          §7 figures and reports (not yet in the repository)
+  results/            small, reviewable result files (not yet in the repository)
+  figs/               figures regenerated from results/ (not yet in the repository)
 ```
 
-## 0. Prerequisites — `prereqs.sh` (available)
+## 0. Prerequisites — `prereqs.sh`
 
 Checks (and optionally installs) everything a run needs on a fresh machine, and
 skips whatever is already present.
@@ -90,7 +227,7 @@ profiling needs root or `NVreg_RestrictProfilingToAdminUsers=0`; on a discrete
 card torch must be a CUDA build matching the toolkit; record the serving-runtime
 version with results, decode throughput depends on it.
 
-## 1. Model assets and path contract — `env.sh`, `configure.sh` (available)
+## 1. Model assets and path contract — `env.sh`, `configure.sh`
 
 Nothing in the repository carries a machine-specific path. Every script reads a
 small set of roots from `env.sh`, and every config file refers to assets through
@@ -138,7 +275,7 @@ points at the expanded copy under `scripts/manifests.local/`.
 go in files you add next to them — `ADDING_A_MODEL.md` walks through the four
 files a model needs and the rules behind each field.
 
-## 2. Machine setup — `setup.sh` (available)
+## 2. Machine setup — `setup.sh`
 
 One idempotent pass that puts a machine in a runnable state and then proves it:
 
@@ -177,7 +314,7 @@ exists, so a downstream stage never inherits a path to something unbuilt.
 Exits non-zero on a blocking problem. A desktop session or a non-maximum power
 mode is a warning, not a block — those matter for certified numbers, not setup.
 
-## 3. Device ceilings (available)
+## 3. Device ceilings
 
 ```bash
 sudo -v                                  # the clock lock needs root; keep it primed
@@ -238,7 +375,7 @@ measures next. Release by hand: Jetson `sudo jetson_clocks --restore
 <run>/provenance/jetson_clocks_saved.conf` (or reboot); discrete `sudo nvidia-smi
 -rgc -rmc`. Normal exit, `set -e`, and Ctrl-C are covered by the trap.
 
-## 4. Per-model measurement (available)
+## 4. Per-model measurement
 
 ```bash
 sudo -v                                  # the measure step pins the clocks; it refuses without root
@@ -287,7 +424,7 @@ provenance, latency, bytes, VRAM and the solo block), `report.md`, the
 provenance set (preflight, lock verification, saved clock state, drift), and the
 raw per-row logs under `engine_rows/`, `e2e/`, `generative/`.
 
-## 5. Co-location and paced runs (available)
+## 5. Co-location and paced runs
 
 ```bash
 sudo -v                                  # the measure step pins the clocks; it refuses without root
@@ -352,17 +489,86 @@ Output: `results/coloc_<device_tag>_<stamp>/` with `verdict.json`, `report.md`
 (`<mix>/<arm>/concurrent_mix.json`, `period_makespan.json`, `row_*.json`,
 `trace_*.csv`, `side_*/`), and the provenance set.
 
-## 6. Power _(pending)_
+## 6. Power
 
-Power-mode and power-cap sweeps; compute-per-watt and bandwidth-per-watt fits.
-The baseline is the device's default operating point (Jetson: the required power
-mode; discrete: the default power limit, which is also the maximum — `-pl` only
-dials down). Every other point in the sweep is a deliberate excursion from it.
+```bash
+sudo -v                                  # the knobs and the clock lock need root; refuses without it
+./scripts/run_power.sh --list            # points of this platform, mixes and arms per point, sweep args — no GPU
+./scripts/run_power.sh                   # every default point: baseline first, then the excursions
+./scripts/run_power.sh --point <p>       # one point (repeatable; ungated points always run before gated ones)
+./scripts/run_power.sh --mix <m>         # one mix per point (repeatable; default: every mix without side rows)
+./scripts/run_power.sh --skip-tops       # mixes only;  --skip-mixes: per-watt sweeps only
+RUN_SECONDS=90 SWEEP_ARGS="--n 4096 --seconds 15" ./scripts/run_power.sh   # run length per solo/arm; sweep length
+```
 
-## 7. Figures and reports _(pending)_
+§3–§5 price a device at its default operating point. The power question is
+the same measurement repeated at every operating point the product may ship
+at: **what does a lower envelope cost in latency, what does it buy in joules,
+and does the mix still fit.** Nothing is scaled or modelled from the baseline
+— every point is re-measured under its own verified clock lock.
+
+**Points** are registered once per platform, in `configs/power/points_<platform>.csv`
+(`point,knob,value,default,gated,note`). The first `default=1` row is the
+baseline: the device's default operating point (Jetson: the required power
+mode; discrete: the default power limit, which is also the maximum — `-pl`
+only dials down). Every other row is a deliberate excursion from it:
+
+| platform | knob | value | point name |
+|---|---|---|---|
+| jetson | `nvpmodel` | mode id | the mode NAME `nvpmodel -q` reports (e.g. `MAXN`, `120W`) |
+| discrete | `pl` | watts | `<value>W` — enforced with `nvidia-smi -pl`; out of the card's range → point skipped |
+| discrete | `lgc` | MHz | `lgc<value>` — a graphics-clock cap held by `-lgc` for the point |
+
+`gated=1` marks a point that alters the hardware configuration beyond clocks
+(a Jetson mode that gates GPU units) and takes effect only after a reboot: the
+kit runs gated points last, marks the boot, and refuses to measure an ungated
+point until the machine has been rebooted — a point measured under a stale
+gating mask would carry the wrong hardware silently.
+
+Per point, in order:
+
+- **apply and read back** (`power/knob_<platform>.sh`) — the knob is applied,
+  read back, and the read-back must name the point (a Jetson mode is judged by
+  the name `nvpmodel -q` reports, never by the exit status; a power limit by
+  `power.limit`); a mismatch fails the point. The read-back is recorded as
+  `readback.json`.
+- **derive the device config** (`power/derive_device_config.py`) — the base
+  device config with the lock targets and required power mode replaced by the
+  point's own caps (Jetson: the devfreq `max_freq` of GPU and EMC; discrete:
+  the power envelope or the `-lgc` cap). §5's preflight, lock verification,
+  clock sampler and drift verdict then adjudicate the point against its own
+  caps — the lock is proved at the point's clock, not at the nameplate.
+- **paced solos and mixes** — §5's `measure_mixes.sh`, unchanged, on the
+  selected mixes under the derived config: every frame row alone at its mix
+  rate, then every arm (plain / mps / streams / mig), with the clock sampler
+  (power rails, clocks, temperature, throttle events) on every process.
+- **per-watt sweeps** (`power/per_watt_sweep.py`) — a paced GEMM per precision
+  (fp16, int8, fp8) and a copy kernel, duty-cycled over 10–100 % busy at a
+  fixed period, clocks **unlocked** (DVFS is what is being measured; a `-lgc`
+  point holds its cap): module W and rail W sampled per target, fitted as
+  `W = intercept + slope × throughput` over the ≥ 45 % busy points, with the
+  saturation knee where a cap pins the board.
+
+**Verdict** (`power/power_verdict.py`) — one column per point, the baseline
+first: per paced row, p99 / miss % / mean W / **J per frame** (mean W × wall /
+frames) and the marginal J (idle subtracted); per cell, makespan p99 / fits /
+N_measured / per-row p99 / mean W / J per period; per precision, the fit, the
+50 % and 100 % points and the delivered per-watt figure. Every excursion column
+carries its ratios to the baseline (p99, W, J; makespan, N, fits changed;
+slope, per-watt, delivered). Checks: baseline present, read-back names the
+point, lock verified, fits linear (R² ≥ 0.95), idle power in band. Cells
+INVALID at the baseline stay INVALID at every point for the same reason.
+
+Output: `results/power_<device_tag>_<stamp>/` with `verdict.json`, `report.md`,
+`provenance/` (state before, points table, the saved clock state) and one
+directory per point: `readback.json`, `device_config.json`, `status.json`, a
+full §5 run under `coloc/` and the sweep under `per_watt/`. The knob is
+restored and the clocks released on exit, whatever happened.
+
+## 7. Figures and reports
 
 Regenerates every figure and table from `results/`; the derivation layer is
-deterministic and diffable against the committed outputs.
+deterministic and diffable against the committed outputs. Not in this repository yet.
 
 ## Measurement discipline
 

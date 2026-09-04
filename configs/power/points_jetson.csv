@@ -1,0 +1,12 @@
+# Stage-6 operating points for a Jetson. One row per point; the point NAME must be
+# the mode name nvpmodel reports for that id (the read-back check compares them).
+#   knob    nvpmodel   value = the mode id in /etc/nvpmodel.conf
+#   default 1 = in the default sweep (./run_power.sh with no --point)
+#   gated   1 = the mode applies a GPU power-gating (TPC) mask that only takes
+#               effect at boot: ungated points measured after it are invalid
+#               until the next reboot (the stage refuses them, boot-id keyed)
+point,knob,value,default,gated,note
+MAXN,nvpmodel,0,1,0,baseline: the required power mode of the run - every other point is an excursion from it
+120W,nvpmodel,1,1,0,GPU clock cap lowered (EMC unchanged); no gating
+90W,nvpmodel,2,0,1,TPC gating mask + clock caps; reboot before any ungated point afterwards
+70W,nvpmodel,3,0,1,same gating mask as 90W; reboot before any ungated point afterwards
