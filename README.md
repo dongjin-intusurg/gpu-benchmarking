@@ -5,7 +5,7 @@ modules and discrete cards — by measurement rather than datasheet. Every capac
 question is answered as demand / capacity, where both sides are measured on the
 device under a locked, exclusive, provenance-stamped regime.
 
-## Quick start — stage 0 to 6 on one machine
+## Quick start — stage 0 to 7 on one machine
 
 The same commands run on a Jetson module and on a discrete card; the scripts
 detect the platform and pick the matching pieces (power tools, serving stack,
@@ -141,9 +141,21 @@ a 2-minute rehearsal.
    paced-solo p99 / J per frame, the co-location cells and the per-watt
    ceilings, each as a ratio to the baseline point.
 
-### Step 7 — figures and reports
+### Step 7 — figures and the report: one command, no GPU
 
-Not in this repository yet; this guide grows by one step when it lands.
+1. **Check** which runs will be read:
+   ```bash
+   ./scripts/run_figures.sh --list               # newest stage 3-6 runs of this device, their counts, the output directory
+   ```
+2. **Run:**
+   ```bash
+   ./scripts/run_figures.sh                      # -> figs/<device_tag>/{data.json, report.md, fig_*.png}
+   ./scripts/run_figures.sh --check              # later: does a regeneration still reproduce what is on disk?
+   ```
+   Under a minute. Stages that have not run are skipped and named in the report.
+3. **Read** `figs/<device_tag>/report.md` — the whole device on one page:
+   sources, ceilings, every solo row with its floor, the co-location matrix,
+   the power points — and the sixteen figures beside it.
 
 ## Layout
 
@@ -164,9 +176,9 @@ gpu-benchmarking/
     colocation/       §5 co-location: mixes, compose, arms, verdict
       arms/           one script per arm (plain, mps, streams, mig)
     power/            §6 power: points, knobs, per-watt sweeps, verdict
-    figures/          §7 figures and reports (not yet in the repository)
+    figures/          §7 figures and report: collect, render, report
   results/            small, reviewable result files (not yet in the repository)
-  figs/               figures regenerated from results/ (not yet in the repository)
+  figs/               figures and report regenerated from results/ (local output)
 ```
 
 ## 0. Prerequisites — `prereqs.sh`
@@ -567,8 +579,65 @@ restored and the clocks released on exit, whatever happened.
 
 ## 7. Figures and reports
 
-Regenerates every figure and table from `results/`; the derivation layer is
-deterministic and diffable against the committed outputs. Not in this repository yet.
+```bash
+./scripts/run_figures.sh                 # newest stage 3-6 runs of this device -> figs/<device_tag>/{data.json, report.md, fig_*.png}
+./scripts/run_figures.sh --list          # the resolved inputs with their counts, and the output directory — writes nothing
+./scripts/run_figures.sh --check         # regenerate into a scratch directory and diff data.json + report.md; exit 1 on a difference
+SOLO_RESULTS=… COLOC_RUN=… POWER_RUN=… CEILINGS_JSON=…   # pin an input; an empty value treats that stage as not run
+OUT_DIR=… DEVICE_TAG=…                    # output directory; device by tag (regenerate on a machine without the GPU)
+```
+
+§3–§6 each end in their own report. Stage 7 reads their newest runs of one
+device and writes one consolidated set — no GPU, no lock, no root — in three
+layers that never reach past each other:
+
+- **collect** (`figures/collect.py`) — the stage-3 `raw/results.json`, the
+  stage-4 `results.json` (plus the per-row `roofline.json` kernels), the
+  stage-5 and stage-6 `verdict.json` → **`data.json`**: every number the
+  figures and the report use, and nothing they do not. Rows, mixes, arms,
+  points and precisions are whatever the runs contain. It also derives the
+  latency floors (`figures/floors.py`: `t_floor = max(bytes /
+  bw_eff, arch GFLOPs / sustained ceiling)` and the N at that floor) and
+  cross-checks provenance: a stage-5 or stage-6 run built on a different
+  stage-4 run than the one used, or a stage-4 run scored against different
+  ceilings, is recorded under `checks` and printed.
+- **render** (`figures/render.py`) — `data.json` → the fixed figure set below.
+  A figure whose stage is absent is skipped.
+- **report** (`figures/report.py`) — `data.json` → `report.md`: sources and
+  provenance checks, device and ceilings, the solo row table with floors and
+  the rate sweep, the co-location matrix with composed budgets and per-cell
+  contention, the power points with per-watt fits, and a fixed set of reading
+  notes. A missing stage is named with the command that produces it.
+
+| figure | question it answers |
+|---|---|
+| `fig_ceilings_attain.png` | per precision, what fraction of the datasheet peak the tensor pipes deliver — kernel-isolated, burst and sustained |
+| `fig_bandwidth.png` | the DRAM kernels against the datasheet line, `bw_eff` marked; the CPU-load haircut curve |
+| `fig_sustained.png` | throughput, GPU clock and temperature over the sustained run against the burst line |
+| `fig_solo_latency.png` | p99 per row against its deadline (placeholder deadlines greyed) |
+| `fig_solo_N.png` | L and C per row, N as the smaller, with the 1.0 and headroom references |
+| `fig_solo_budgets.png` | the three budget gauges per row with the binding one marked |
+| `fig_bound_mix.png` | share of engine time memory- / compute- / latency-bound per row |
+| `fig_roofline.png` | per engine row, every kernel against the DRAM roof and the pipe ceilings |
+| `fig_floors.png` | p99 against its roofline floor; N against N at the floor |
+| `fig_rate_sweep.png` | N against the candidate rate per generative row, the highest rate at N = 1 marked |
+| `fig_coloc_matrix.png` | N measured per mix × arm; invalid and unfit cells marked |
+| `fig_coloc_contention.png` | per mix and row, paced-solo → contended p99 per arm against the deadline |
+| `fig_coloc_bounds.png` | per cell, L contended against C composed, and makespan p99 over the period |
+| `fig_power_solo.png` | per operating point, paced-solo p99, mean W and energy per frame per row |
+| `fig_power_cells.png` | per operating point, N measured and energy per period per cell |
+| `fig_power_per_watt.png` | delivered throughput against W with the fit, per-watt and clock against busy % |
+
+**Determinism.** `data.json` is written with sorted keys, no NaN and no
+timestamp outside its `sources` block; figures render with a pinned style,
+fixed sizes and no software or time metadata. `--check` regenerates
+`data.json` and `report.md` into a scratch directory and diffs them byte for
+byte against the output directory: exit 0 means the runs on disk still
+reproduce what is committed there, exit 1 prints the diff. Regenerate after
+every new stage 3–6 run; the diff is the change.
+
+Output: `figs/<device_tag>/` with `data.json`, `report.md` and the figures
+above. `FIGS_ROOT` moves the root (`env.sh`).
 
 ## Measurement discipline
 

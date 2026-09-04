@@ -330,3 +330,12 @@ Rules: names unique; every column present; a `pl` value outside the card's
 point will run. The mixes come from stage 5's registry
 (`configs/colocation/*.csv`): by default the ones without side rows; `--mix`
 selects any registered mix.
+
+## 9. Figures and the report — nothing to register
+
+Stage 7 (`./scripts/run_figures.sh`) draws whatever the newest runs contain:
+a new model appears as a row in the solo figures and the report, a new mix
+as a row of the co-location matrix, a new operating point as a column of the
+power tables. No file names a row, a mix or a point — if a figure lacks your
+model, the run it should come from is missing or invalid, and `--list` shows
+which runs the stage resolved.
