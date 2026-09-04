@@ -105,10 +105,24 @@ if [ "$PLATFORM" = jetson ]; then
   sudo -n jetson_clocks 2>/dev/null || die "jetson_clocks failed"
 else
   MAXGC=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits | head -1)
+  # Lock the bins the device config declares, not the nameplate max. Stage 3 and
+  # run_model_bench.sh already do this; locking to a boost bin the part cannot
+  # hold makes verify_lock adopt the realized clock as the reference, and every
+  # heavy row then adjudicates against a clock that was never actually held.
+  MAXMC=$(nvidia-smi --query-gpu=clocks.max.memory --format=csv,noheader,nounits | head -1)
+  CFG_SMLOCK=$(python3 -c 'import json,sys;v=json.load(open(sys.argv[1])).get("sm_lock_mhz");print(v if v else "")' "$DEVICE_CFG")
+  [ -n "$CFG_SMLOCK" ] && MAXGC="$CFG_SMLOCK"
+  CFG_MEMLOCK=$(python3 -c 'import json,sys;v=json.load(open(sys.argv[1])).get("mem_lock_mhz");print(v if v else "")' "$DEVICE_CFG")
+  [ -n "$CFG_MEMLOCK" ] && MAXMC="$CFG_MEMLOCK"
   sudo -n nvidia-smi -pm 1 >/dev/null 2>&1; sudo -n nvidia-smi -lgc "$MAXGC" >/dev/null 2>&1 || die "-lgc failed"
+  sudo -n nvidia-smi -lmc "$MAXMC" >/dev/null 2>&1 \
+    || say "WARN: -lmc unsupported on this part; memory clock floats"
 fi
 CLOCKS_LOCKED=1; start_keepalive; say "clocks pinned"
-python3 "$KIT/common/verify_lock.py" --device "$DEVICE_CFG" --out "$OUT/provenance/lock_verified.json" 2>&1 | tee -a "$LOG"
+  # MAXGC/MAXMC are set only on the discrete branch above; on jetson nothing is
+  # passed and verify_lock resolves its targets from the device config as before.
+  python3 "$KIT/common/verify_lock.py" --device "$DEVICE_CFG" --out "$OUT/provenance/lock_verified.json" \
+  ${MAXGC:+--requested "sm=${MAXGC},mem=${MAXMC}"} 2>&1 | tee -a "$LOG"
 [ "${PIPESTATUS[0]}" -eq 0 ] || die "clock-lock verification FAILED - evidence: $OUT/provenance/lock_verified.json"
 
 # engine rows -> run_model_bench.sh (re-locks under the outer lock, verifies, measures)

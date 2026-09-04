@@ -27,7 +27,21 @@ Exit 0 = PASS, 2 = INVESTIGATE.
 """
 import argparse, collections, hashlib, json, os, subprocess, sys
 
-MAP = {'int8': 'Int8', 'fp8': 'Fp8', 'fp16': 'Half', 'fp32': 'Float'}
+# TensorRT names an output format either as a bare datatype ("Float") or as a
+# descriptive sentence ("Row major linear FP32", "Thirty-two wide channel
+# vectorized row major Int8 format"). An exact lookup sees only the bare form,
+# so a correctly built engine whose layers use a vectorized layout - which is
+# what the int8 and fp8 fast paths actually emit - counted as 0% and was failed
+# as a silent fallback. Match any alias as a case-insensitive substring.
+MAP = {'int8': ('int8',), 'fp8': ('fp8',), 'fp16': ('fp16', 'half'), 'fp32': ('fp32', 'float')}
+
+
+def frac_of(counter, aliases):
+    """share of layer outputs whose format names any of these aliases"""
+    tot = sum(counter.values()) or 1
+    hit = sum(v for k, v in counter.items()
+              if any(a in str(k).lower() for a in aliases))
+    return hit / tot
 
 
 def sha256(p, buf=1 << 20):
@@ -110,10 +124,10 @@ def main():
                         want_prec = p; break
             if want_prec:
                 key = MAP.get(want_prec)
-                frac = c.get(key, 0) / tot
+                frac = frac_of(c, key) if key else 0.0
                 if frac < a.min_frac:
                     fails.append(f'{name}: requested {want_prec} but only {frac*100:.0f}% of layer '
-                                 f'outputs are {key} - the builder fell back to another precision')
+                                 f'outputs are {want_prec} - the builder fell back to another precision')
                 else:
                     lines.append(f'[2] requested {name:38} {want_prec}: {frac*100:.0f}% of outputs (>= {a.min_frac*100:.0f}%)  PASS')
         else:
