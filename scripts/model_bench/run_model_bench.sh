@@ -70,7 +70,7 @@ export PATH="$PATH:/usr/src/tensorrt/bin"
 
 MIX_FILE="${1:-mix.csv}"
 OUT_DIR="${2:-ecc_results_$(date +%Y%m%d_%H%M%S)}"
-mkdir -p "$OUT_DIR"/{provenance,models,report}
+mkdir -p "$OUT_DIR"/{provenance,models,report,ncu_reports}
 LOG="$OUT_DIR/pipeline.log"
 say() { echo -e "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 die() { echo "[FATAL] $*" >&2; exit 1; }
@@ -337,6 +337,9 @@ stage3_models() {
       # in ncu_meta.json). Stage 5 additionally clamps to the physical bound.
       NCU_ITERS="${NCU_ITERS:-5}"
       NCU_ARGS=(--csv --target-processes all -f --cache-control none)
+      # the same pass also saved as a report for the NCU GUI / ncu --import
+      # (<out>/ncu_reports/<model>.ncu-rep); -f overwrites a previous one
+      NCU_ARGS+=(--export "$OUT_DIR/ncu_reports/$NAME")
       if [ "${NCU_FULL:-0}" = 1 ]; then
         NCU_ARGS+=(--set full)
       else
