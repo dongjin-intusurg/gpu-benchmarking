@@ -48,6 +48,28 @@ def read_vram(path):
         return None, 'none'
 
 
+def read_drift(path):
+    """drift_report.py verdict for the row window -> the clock_integrity block the
+    engine rows carry; a FAIL invalidates the row (measurement_valid False)."""
+    try:
+        d = json.load(open(path))
+    except Exception:
+        return {'verdict': None, 'note': 'drift.json missing - no under-load clock evidence recorded'}, True
+    ci = {'verdict': d.get('verdict'), 'pct_at_target': d.get('pct_at_target'),
+          'reference_clock_mhz': d.get('reference_clock_mhz'),
+          'throttle_reasons_seen': d.get('throttle_reasons_seen', d.get('throttle_reasons')),
+          'clamp_events': d.get('clamp_events', d.get('clamp_event_count', d.get('oc_clamp_events')))}
+    return ci, ci['verdict'] != 'FAIL'
+
+
+def stamp_rows(rows, drift_path):
+    ci, ok = read_drift(drift_path)
+    for r in rows:
+        r['clock_integrity'] = ci
+        r['measurement_valid'] = ok
+    return rows
+
+
 # ---------------------------------------------------------------- select / mix
 def cmd_select(a):
     rows = load_rows(a.rows_dir, a.only, a.kind)
@@ -120,7 +142,7 @@ def cmd_e2e(a):
              'vram_mb': vram, 'vram_source': vsrc,
              'e2e': {'decode_ms_median': detail['decode_ms_median'], 'decode_ms_p99_max': detail['decode_ms_p99_max'],
                      'ttft_ms_median': detail['ttft_ms_median'], 'jsonl': a.jsonl}}]
-    json.dump(rows, open(a.out, 'w'), indent=1)
+    json.dump(stamp_rows(rows, a.drift), open(a.out, 'w'), indent=1)
     print(f"  {rows[0]['name']:26} gpu_total p99 {rows[0]['latency_ms']:.3f} ms  ttft {detail['ttft_ms_median']:.1f}  rtf {detail['rtf_wall_median']}")
     print(f"  {rows[1]['name']:26} decode step p99 {rows[1]['latency_ms']:.3f} ms  at {rows[1]['hz']} tok/s")
 
@@ -214,7 +236,7 @@ def cmd_edgellm(a):
                      'vram_mb': vram, 'vram_source': vsrc,
                      'e2e': {'decode_ms_median': prof.get('decode_ms_median'), 'decode_ms_p99': prof['decode_ms_p99'],
                              'tokens_per_second': prof.get('tokens_per_second'), 'ttft_ms': prof['ttft_ms']}})
-    json.dump(rows, open(a.out, 'w'), indent=1)
+    json.dump(stamp_rows(rows, a.drift), open(a.out, 'w'), indent=1)
     print(f"  {row['name']:26} step {step:.1f} ms (vis {vis} + prefill {pre}/{reuse} + {chunk}x{dec})  "
           f"tok/s {1000/dec:.1f}" + (f"  e2e ttft {prof['ttft_ms']:.1f} tok/s {prof['tokens_per_second']:.1f}" if prof else ''))
     if len(rows) > 1:
@@ -242,7 +264,7 @@ def cmd_trtllm(a):
                           'prefill_cold_ms': comp.get('prefill_cold_ms'), 'decode_ms': comp.get('decode_ms'),
                           'tokens_per_s_bench': round(1000.0 / comp['decode_ms'], 2) if comp.get('decode_ms') else None,
                           'step_ms_p50': c.get('total_ms_p50'), 'n': c.get('n'), 'chunk': int(chunk), 'sweep': a.sweep}}
-    json.dump([row], open(a.out, 'w'), indent=1)
+    json.dump(stamp_rows([row], a.drift), open(a.out, 'w'), indent=1)
     print(f"  {row['name']:26} step p99 {row['latency_ms']:.1f} ms  ttft {comp.get('ttft_ms')}  decode {comp.get('decode_ms')} ms/tok")
 
 
@@ -254,7 +276,7 @@ def engine_row_summary(m):
             'hz': m.get('hz'), 'deadline_ms': m.get('deadline_ms'), 'arch_gflops': m.get('arch_gflops'),
             'bytes_per_frame_MB': m.get('bytes_per_frame_MB'), 'bytes_source': m.get('bytes_source'),
             'vram_mb': m.get('vram_budget_mb') or m.get('vram_mb'), 'vram_source': m.get('vram_source'),
-            'solo': s, 'measurement_valid': m.get('measurement_valid')}
+            'solo': s, 'clock_integrity': m.get('clock_integrity'), 'measurement_valid': m.get('measurement_valid')}
 
 
 def cmd_merge(a):
@@ -350,11 +372,11 @@ def main():
     p = sp.add_parser('mix'); p.add_argument('--rows-dir', required=True); p.add_argument('--only', action='append', default=[])
     p.add_argument('--out', required=True); p.set_defaults(f=cmd_mix)
     p = sp.add_parser('e2e'); p.add_argument('--row', required=True); p.add_argument('--jsonl', required=True)
-    p.add_argument('--vram', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_e2e)
+    p.add_argument('--vram', default=''); p.add_argument('--drift', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_e2e)
     p = sp.add_parser('edgellm'); p.add_argument('--row', required=True); p.add_argument('--bench-dir', required=True)
-    p.add_argument('--profile', default=''); p.add_argument('--vram', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_edgellm)
+    p.add_argument('--profile', default=''); p.add_argument('--vram', default=''); p.add_argument('--drift', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_edgellm)
     p = sp.add_parser('trtllm'); p.add_argument('--row', required=True); p.add_argument('--sweep', required=True)
-    p.add_argument('--vram', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_trtllm)
+    p.add_argument('--vram', default=''); p.add_argument('--drift', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_trtllm)
     p = sp.add_parser('merge'); p.add_argument('--budgets', default=''); p.add_argument('--engine-results', default='')
     p.add_argument('--provenance', default=''); p.add_argument('--out', required=True); p.add_argument('--report', required=True); p.set_defaults(f=cmd_merge)
     a = ap.parse_args()

@@ -77,11 +77,12 @@ PY
 # the same (idempotent) lock for its own provenance and restores to this
 # pinned state; the true pre-run state is restored by this script's trap.
 #-----------------------------------------------------------------------------
-CLOCKS_LOCKED=0; KEEPALIVE_PID=""; SAMPLER_PID=""
+CLOCKS_LOCKED=0; KEEPALIVE_PID=""; SAMPLER_PID=""; CLK_ANCHOR=""; CLK_SAMPLER=""
 start_keepalive(){ ( while true; do sudo -n true 2>/dev/null || exit 0; sleep 60; done ) & KEEPALIVE_PID=$!; }
 cleanup(){
   [ -n "$KEEPALIVE_PID" ] && { kill "$KEEPALIVE_PID" 2>/dev/null || true; }
   [ -n "$SAMPLER_PID" ] && { kill "$SAMPLER_PID" 2>/dev/null || true; }
+  [ -n "$CLK_ANCHOR" ] && { kill "$CLK_ANCHOR" 2>/dev/null || true; }
   [ "$CLOCKS_LOCKED" = 1 ] || return 0
   say "releasing clock locks..."
   if [ "$PLATFORM" = jetson ]; then
@@ -161,6 +162,22 @@ GEN_ROWS=$(python3 "$MR" select --rows-dir "$ROWS_DIR" "${ONLY[@]}" --kind gener
 NONENGINE_JSONS=()
 
 if [ -n "$E2E_ROWS$GEN_ROWS" ]; then
+  # Under-load clock evidence for the whole row window (every sub-benchmark of
+  # the row, as the engine rows have for their timing pass): the device-aware
+  # sampler follows an anchor process that lives from row_clock_start to
+  # row_clock_stop, and drift_report.py adjudicates the samples against the
+  # run's verified lock. A FAIL marks the row measurement_valid:false.
+  row_clock_start(){ # dir phase
+    sleep 2147483 & CLK_ANCHOR=$!
+    python3 "$KIT/common/clock_sampler.py" --device "$DEVICE_CFG" --pid "$CLK_ANCHOR" \
+      --out "$1/clock_samples.csv" --phase "$2" >/dev/null 2>&1 & CLK_SAMPLER=$!
+  }
+  row_clock_stop(){ # dir phase
+    kill "$CLK_ANCHOR" 2>/dev/null; wait "$CLK_SAMPLER" 2>/dev/null; CLK_ANCHOR=""; CLK_SAMPLER=""
+    python3 "$KIT/common/drift_report.py" "$1/clock_samples.csv" --device "$DEVICE_CFG" \
+      --lock "$OUT/provenance/lock_verified.json" --out "$1/drift.json" --phase "$2" >/dev/null 2>&1 \
+      || say "  WARN: drift report failed for $2 - clock integrity unrecorded for this row"
+  }
   # run one measured process with the peak-memory sampler on its pid
   sampled(){ # vram_out log cmd...
     local vout="$1" log="$2"; shift 2
@@ -196,12 +213,14 @@ if [ -n "$E2E_ROWS" ]; then
         || { tail -15 "$D/compile.log" | tee -a "$LOG"; say "  $ROW: driver failed to compile - $D/compile.log"; continue; }
     fi
     # relative paths inside the input list resolve against the list's directory
+    row_clock_start "$D" "e2e:$ROW"
     ( cd "$(dirname "$INPUTS")" && sampled "$D/vram.json" "$D/driver.log" \
         "$BIN" "$ENGINE_DIR" "$PRECISION" "$INPUTS" "$D/out.jsonl" "$REPEATS" 0 $ARGS )
     rc=$?
+    row_clock_stop "$D" "e2e:$ROW"
     [ $rc -eq 0 ] && [ -s "$D/out.jsonl" ] || { tail -10 "$D/driver.log" | tee -a "$LOG"; say "  $ROW: driver failed (rc=$rc) - $D/driver.log"; continue; }
     python3 "$MR" select --rows-dir "$ROWS_DIR" --kind e2e | python3 -c "import json,sys; [json.dump(r, open('$D/row.json','w')) for r in json.load(sys.stdin) if r['row']=='$ROW']"
-    python3 "$MR" e2e --row "$D/row.json" --jsonl "$D/out.jsonl" --vram "$D/vram.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
+    python3 "$MR" e2e --row "$D/row.json" --jsonl "$D/out.jsonl" --vram "$D/vram.json" --drift "$D/drift.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
       && NONENGINE_JSONS+=("$D/rows.json")
   done <<< "$E2E_ROWS"
 fi
@@ -223,6 +242,7 @@ if [ -n "$GEN_ROWS" ]; then
         [ -x "$BENCH" ] || die "llm_bench missing at $BENCH - build the Edge-LLM runtime first"
         export EDGELLM_PLUGIN_PATH="${EDGELLM_PLUGIN_PATH:-$EDGELLM_ROOT/build/libNvInfer_edgellm_plugin.so}"
         say "=== generative (Edge-LLM): $ROW  chunk $CHUNK, context $CONTEXT_LEN, reuse $REUSE_LEN"
+        row_clock_start "$D" "generative:$ROW"
         if [ -n "${VISUAL_DIR:-}" ]; then
           # the visual engine is shared by every precision of a model: measure once, link
           if [ -n "${VISLOG[$MODEL]:-}" ]; then
@@ -270,7 +290,8 @@ PYSNAP
             && PROFILE="$D/e2e_profile.json" \
             || { tail -8 "$D/e2e.log" | tee -a "$LOG"; say "  $ROW: llm_inference failed - bench numbers only"; }
         fi
-        python3 "$MR" edgellm --row "$D/row.json" --bench-dir "$D" ${PROFILE:+--profile "$PROFILE"} --vram "$D/vram.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
+        row_clock_stop "$D" "generative:$ROW"
+        python3 "$MR" edgellm --row "$D/row.json" --bench-dir "$D" ${PROFILE:+--profile "$PROFILE"} --vram "$D/vram.json" --drift "$D/drift.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
           && NONENGINE_JSONS+=("$D/rows.json")
         ;;
       trtllm)
@@ -285,10 +306,12 @@ PYSNAP
           || die "tensorrt_llm is not importable with '$TRT_PY' - point BENCH_PY at the TensorRT-LLM venv interpreter (Edge-LLM is not a substitute on this platform)"
         say "=== generative (TensorRT-LLM): $ROW  chunk $CHUNK on $(basename "$SERVING_DIR")"
         # this loop reads its rows from a here-string; the sweep must not consume it
+        row_clock_start "$D" "generative:$ROW"
         sampled "$D/vram.json" "$D/sweep.log" "$TRT_PY" "$STEP" sweep --model "$SERVING_DIR" --image "$IMAGE" \
-            --out "$D" --tag "$ROW" --state locked --chunks "$CHUNK" < /dev/null \
-          || { tail -10 "$D/sweep.log" | tee -a "$LOG"; say "  $ROW: sweep failed - $D/sweep.log"; continue; }
-        python3 "$MR" trtllm --row "$D/row.json" --sweep "$D/sweep_${ROW}_locked.json" --vram "$D/vram.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
+            --out "$D" --tag "$ROW" --state locked --chunks "$CHUNK" < /dev/null
+        rc=$?; row_clock_stop "$D" "generative:$ROW"
+        [ $rc -eq 0 ] || { tail -10 "$D/sweep.log" | tee -a "$LOG"; say "  $ROW: sweep failed - $D/sweep.log"; continue; }
+        python3 "$MR" trtllm --row "$D/row.json" --sweep "$D/sweep_${ROW}_locked.json" --vram "$D/vram.json" --drift "$D/drift.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
           && NONENGINE_JSONS+=("$D/rows.json")
         ;;
       *) die "$ROW: unknown runtime '$RUNTIME'" ;;

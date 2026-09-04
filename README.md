@@ -15,7 +15,7 @@ gpu-benchmarking/
   prereqs.sh          check / install prerequisites          (available)
   env.sh              root variables every script reads      (available)
   configure.sh        expand config templates for this host  (available)
-  configs/            mix / manifest / device-config templates       (available)
+  configs/            mix / manifest / device-config / co-location templates (available)
   ADDING_A_MODEL.md   how to describe a new model            (available)
   setup.sh            symlinks, helper builds, resolve check (available)
   scripts/            measurement code, one directory per stage:
@@ -24,7 +24,8 @@ gpu-benchmarking/
     model_bench/      §4 per-model: registry, build, measure, scorer      (available)
       cpp/            the C++ row loop and the end-to-end ASR driver
       trtllm/         the discrete generative stack helpers (TensorRT-LLM)
-    colocation/       §5 co-location and paced runs                        (pending)
+    colocation/       §5 co-location: mixes, compose, arms, verdict         (available)
+      arms/           one script per arm (plain, mps, streams, mig)
     power/            §6 power sweeps                                       (pending)
     figures/          §7 figures and reports                               (pending)
   results/            small, reviewable result files                       (pending)
@@ -286,12 +287,70 @@ provenance, latency, bytes, VRAM and the solo block), `report.md`, the
 provenance set (preflight, lock verification, saved clock state, drift), and the
 raw per-row logs under `engine_rows/`, `e2e/`, `generative/`.
 
-## 5. Co-location and paced runs _(pending)_
+## 5. Co-location and paced runs (available)
 
-Multi-model arms (plain / MPS / streams / MIG where available), shared-trigger
-period makespan, and the composed budget for a target mix. The solo §4 numbers
-are the inputs; this stage measures what actually happens when the rows run
-together.
+```bash
+sudo -v                                  # the measure step pins the clocks; it refuses without root
+./scripts/run_colocation.sh --list       # mixes, resolved rows, arms this platform supports — no GPU
+./scripts/run_colocation.sh              # validate -> compose -> paced solo -> arms -> verdict, every mix x arm
+./scripts/run_colocation.sh --mix <m>    # one mix (repeatable);  --arm <a>: one arm (repeatable)
+./scripts/run_colocation.sh --skip-solo  # reuse the newest run's paced solos: arms only
+RUN_SECONDS=90 SOLO_RESULTS=<results.json> ./scripts/run_colocation.sh   # run length; a §4 run other than the newest
+```
+
+§4 prices every configuration alone. The sizing question is the composed one:
+what happens when the rows of a target mix share one device. **A mix is
+registered once**, as `configs/colocation/<mix>.csv` — rows referenced by their
+§4 row name with a role, the mix's rate and deadline, and the per-arm levers
+(`prio` for the streams arm, `mps_pct` for the MPS arm; see
+`configs/colocation/template.csv`). Engines, run flags and precisions are
+resolved from the registry rows and the newest §4 `results.json`, never
+re-typed. A variant of a mix is just another CSV.
+
+- `role=frame` — an engine row, paced by `row_loop` at its mix Hz (one
+  process per row; one process with one stream per row in the streams arm).
+  Every frame carries a launch/done trace.
+- `role=side` — the model's own runtime alongside the frames: the ASR driver in
+  real time, a generative battery back-to-back (Edge-LLM on Jetson, TensorRT-LLM
+  on a discrete card). Reported by its own harness, never part of the makespan.
+  `hz=X` on a side row means the spec rate is undecided: it is charged
+  back-to-back and the composed table shows `time_share_at_spec` on the §4
+  rate grid.
+
+- **validate** (`colocation/validate_mixes.sh`) — no GPU; every error at once:
+  unknown row, row absent from the §4 results, a frame role on a non-engine
+  row, `X` on a frame row, `prio` outside the device's stream priority range
+  (queried from `row_loop --prio-range`), an arm the platform lacks.
+- **compose** (`colocation/compose_mix.py`) — no GPU; the arithmetic budget
+  of the mix from §4 numbers and the §3 ceilings: Σ time / bandwidth / VRAM
+  shares, U_max, C, L, N_predicted, cause, and a per-frame-row prediction of
+  the contended p99 (`solo p99 / (1 − U_time of the other residents)`, null
+  when the others saturate).
+- **measure** (`colocation/measure_mixes.sh`) — **one verified clock lock for
+  the run**, released on exit. Per mix: *paced solo* of every row at its mix
+  rate with the same driver and duty (the contention reference; reused when it
+  exists), then every arm — `plain` (one process per row, ready barrier before
+  the first frame), `mps` (daemon started per arm into its own pipe directory,
+  existence verified, per-row thread caps from the CSV), `streams` (one process,
+  one prioritised stream per row), `mig` (discrete only; a Jetson below the
+  supporting L4T records `unsupported`). Every arm writes the same
+  `concurrent_mix.json` and a period makespan from the traces.
+- **verdict** (`colocation/verdict.py`) — one cell per (mix, arm). `valid`:
+  the rows actually overlapped (`aligned`), every row ran the C++ driver, traces
+  and drift are in, the MPS daemon was verified where it should be — a cell
+  that ran clean but never contended is `invalid`, a field, not a warning.
+  `fits`: every frame row misses < 1 % of its deadlines and finishes before its
+  own next trigger ≥ 99 % of the time, and every side row holds its rate (ASR
+  RTF < 1). Per row: `contention_factor` = contended p99 / paced-solo p99 and
+  the error of the composed prediction; per cell: makespan p99 vs period, free
+  time = period − Σ paced-solo p99, `N_measured = min(L_contended, C_composed)`
+  beside `N_predicted`, and the cause.
+
+Output: `results/coloc_<device_tag>_<stamp>/` with `verdict.json`, `report.md`
+(the mixes × arms matrix, the composed table per mix, a row table per cell),
+`resolved/` and `composed/` per mix, `paced_solo/`, one directory per cell
+(`<mix>/<arm>/concurrent_mix.json`, `period_makespan.json`, `row_*.json`,
+`trace_*.csv`, `side_*/`), and the provenance set.
 
 ## 6. Power _(pending)_
 

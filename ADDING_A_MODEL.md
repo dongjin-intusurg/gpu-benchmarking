@@ -267,3 +267,38 @@ row per measured configuration), `report.md`, `provenance/`, and the per-row
 
 See `REPRODUCIBILITY.md` for the error bands to expect on each quantity, and
 `METHOD_NOTES.md` for the measurement rules and the gotchas behind them.
+
+## 7. Registering a mix — `configs/colocation/<mix>.csv`
+
+Stage 5 co-locates rows that stage 4 has already measured. Copy
+`configs/colocation/template.csv` to `configs/colocation/<mix>.csv` and keep
+only real rows:
+
+```
+row,role,hz,deadline_ms,prio,mps_pct,note
+depth_int8,frame,30,33.3,0,,paced at 30 Hz
+tracker_int8,frame,30,33.3,-5,,short row; priority lever in the streams arm
+asr_e2e,side,0,50,,35,real-time ASR; 35 % thread cap in the mps arm
+vlm_nvfp4,side,X,100,,,generative step battery back-to-back; X = spec rate undecided
+```
+
+| column | meaning |
+|---|---|
+| `row` | a stage-4 row name (`engines/<tag>/registry_rows/*.jsonl`) that the newest `results/solo_<tag>_*/results.json` scored — that run supplies solo p99, bytes and VRAM; `SOLO_RESULTS=<results.json>` selects another |
+| `role` | `frame`: an engine row paced by `row_loop` at `hz`. `side`: an end-to-end or generative row run by its own runtime (ASR driver in real time; generative battery back-to-back), reported by its harness, never in the makespan |
+| `hz` | frame rows: the pacing rate (> 0). Side rows: `0` or a number for the composed table, or `X` = rate not decided (charged back-to-back, `time_share_at_spec` on the stage-4 rate grid) |
+| `deadline_ms` | the mix deadline for this row (overrides the stage-4 placeholder) |
+| `prio` | CUDA stream priority, streams arm only (numerically lower = higher; range from `row_loop --prio-range`, printed by `--list`); blank = 0 |
+| `mps_pct` | `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` for this row's process, mps arm only; blank = uncapped |
+
+Rules the validator enforces in one pass: every row registered and scored; at
+least one frame row; no duplicates; `frame` only on engine rows and `side` only
+on end-to-end / generative rows; `X` only on side rows; `prio` inside the
+device's range; `mps_pct` in 1–100; an `--arm` the platform supports (Jetson:
+plain, mps, streams — mig is recorded `unsupported` below the supporting L4T;
+discrete: plain, mps, streams, mig).
+
+`./scripts/run_colocation.sh --list` shows every mix resolved (engine path,
+run flags, stage-4 solo p99 per row) and the arm set; `--mix <m>` limits a run
+to one mix. The engines a mix uses are the stage-4 artifacts — nothing is built
+here, and a row whose engine is missing fails validation rather than the run.

@@ -1,0 +1,16 @@
+# One mix = one CSV under configs/colocation/<mix>.csv. Copy this file to <mix>.csv and keep only real rows.
+# Columns:
+#   row          a stage-4 row name (engines/<tag>/registry_rows) that the newest stage-4 results.json scored
+#   role         frame -> engine row paced by row_loop at hz; side -> the model's own runtime (ASR driver in
+#                real time, generative battery back-to-back), reported by its harness, never in the makespan
+#   hz           frame rows: pacing rate > 0; side rows: 0 or a number for the composed table, or X = rate not
+#                decided (charged back-to-back; time_share_at_spec on the stage-4 rate grid)
+#   deadline_ms  the mix deadline for this row (overrides the stage-4 placeholder)
+#   prio         CUDA stream priority, streams arm only (numerically lower = higher); blank = 0
+#   mps_pct      CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for this row's process, mps arm only; blank = uncapped
+#   note         free text
+row,role,hz,deadline_ms,prio,mps_pct,note
+depth_int8,frame,30,33.3,0,,paced at 30 Hz
+tracker_int8,frame,30,33.3,-5,,short row; priority lever in the streams arm
+asr_e2e,side,0,50,,35,real-time ASR; 35 % thread cap in the mps arm
+vlm_nvfp4,side,X,100,,,generative step battery back-to-back; X = spec rate undecided
