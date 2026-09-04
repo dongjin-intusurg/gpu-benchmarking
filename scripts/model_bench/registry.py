@@ -295,6 +295,13 @@ def load(args):
         if rec['name'] in seen:
             errs.append(f'{rec["name"]}: registered twice ({seen[rec["name"]]} and {f}) - one manifest per model')
         seen[rec['name']] = f
+        # member rows are named <name>_<member>; one colliding with another
+        # registration's name would share its results directory and overwrite it
+        for m in (rec.get('members') or []):
+            rn = f"{rec['name']}_{m}"
+            if rn in seen and seen[rn] != f:
+                errs.append(f'{rec["name"]}: member row "{rn}" collides with the model registered in {seen[rn]} - rename one')
+            seen[rn] = f
         recs.append(rec)
     if args.only:
         for o in args.only:

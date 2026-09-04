@@ -139,6 +139,16 @@ if [ "$n_engine" -gt 0 ]; then
   [ $rc -eq 0 ] && [ -f "$OUT/engine_rows/report/results.json" ] \
     || die "engine rows failed (rc=$rc) - see $OUT/engine_rows.log"
   ENGINE_RESULTS="$OUT/engine_rows/report/results.json"
+  # run_model_bench.sh's exit trap released the clocks, and nvidia-smi -rgc is
+  # not nested: it dropped the lock taken above as well. The e2e and generative
+  # rows that follow must run under the same lock, so re-pin it. (jetson_clocks
+  # --restore in the same trap restores the pinned state it stored, so jetson
+  # keeps its lock without this.)
+  if [ "$PLATFORM" != jetson ] && [ -n "${MAXGC:-}" ]; then
+    sudo -n nvidia-smi -lgc "$MAXGC" >/dev/null 2>&1 || die "re-lock -lgc $MAXGC failed after the engine rows"
+    sudo -n nvidia-smi -lmc "$MAXMC" >/dev/null 2>&1 || true
+    say "clocks re-pinned (sm=$MAXGC mem=$MAXMC) for the e2e and generative rows"
+  fi
 else
   say "=== engine rows: none selected"
 fi
@@ -175,7 +185,13 @@ if [ -n "$E2E_ROWS" ]; then
     BIN="$OUT/e2e/bin/${MODEL}_e2e"
     say "=== e2e: $ROW  ($(basename "$SRC") over $ENGINE_DIR, $PRECISION, repeats $REPEATS)"
     if [ ! -x "$BIN" ]; then
+      # A discrete box normally carries TensorRT as a tarball beside the trtexec on
+      # PATH, so its headers are not under the multiarch include dir. Add that
+      # root when it exists (setup.sh compiles the same source the same way).
+      _tx=$(command -v trtexec 2>/dev/null || true); _tr=""
+      [ -n "$_tx" ] && _tr=$(cd "$(dirname "$_tx")/.." 2>/dev/null && pwd)
       g++ -O2 -std=c++17 "$SRC" -I"/usr/include/$(gcc -dumpmachine)" -I/usr/local/cuda/include \
+          ${_tr:+$([ -d "$_tr/include" ] && echo "-I$_tr/include")} ${_tr:+$([ -d "$_tr/lib" ] && echo "-L$_tr/lib")} \
           -L/usr/local/cuda/lib64 -lnvinfer -lnvinfer_plugin -lcudart -ldl -lpthread -o "$BIN" > "$D/compile.log" 2>&1 \
         || { tail -15 "$D/compile.log" | tee -a "$LOG"; say "  $ROW: driver failed to compile - $D/compile.log"; continue; }
     fi
@@ -268,8 +284,9 @@ PYSNAP
         "$TRT_PY" -c 'import tensorrt_llm' >/dev/null 2>&1 \
           || die "tensorrt_llm is not importable with '$TRT_PY' - point BENCH_PY at the TensorRT-LLM venv interpreter (Edge-LLM is not a substitute on this platform)"
         say "=== generative (TensorRT-LLM): $ROW  chunk $CHUNK on $(basename "$SERVING_DIR")"
+        # this loop reads its rows from a here-string; the sweep must not consume it
         sampled "$D/vram.json" "$D/sweep.log" "$TRT_PY" "$STEP" sweep --model "$SERVING_DIR" --image "$IMAGE" \
-            --out "$D" --tag "$ROW" --state locked --chunks "$CHUNK" \
+            --out "$D" --tag "$ROW" --state locked --chunks "$CHUNK" < /dev/null \
           || { tail -10 "$D/sweep.log" | tee -a "$LOG"; say "  $ROW: sweep failed - $D/sweep.log"; continue; }
         python3 "$MR" trtllm --row "$D/row.json" --sweep "$D/sweep_${ROW}_locked.json" --vram "$D/vram.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
           && NONENGINE_JSONS+=("$D/rows.json")

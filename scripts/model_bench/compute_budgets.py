@@ -172,7 +172,7 @@ def score_row(row, bw_eff, vram_cap):
             row['solo']['max_hz_at_N1'], row['solo']['max_hz_bound_by'] = 0.0, 'vram'
         else:
             cands = {'time': 1e3 / lat}
-            if bytes_mb is not None and bw_eff:
+            if bytes_mb and bw_eff:      # 0 bytes (unknown) cannot bound the rate; None and 0 alike
                 cands['dram_bandwidth'] = bw_eff * 1e3 / bytes_mb
             k = min(cands, key=cands.get)
             row['solo']['max_hz_at_N1'], row['solo']['max_hz_bound_by'] = round(cands[k], 2), k

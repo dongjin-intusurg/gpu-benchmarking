@@ -310,7 +310,7 @@ build_trtllm(){
     esac
     python3 "$MB_DIR/validate_engines.py" --serving "$dir" >> "$log" 2>&1 \
       || { tail -8 "$log"; say "  [trtllm] $dir failed validation - $log"; return 1; }
-    local bytes; bytes=$(du -sb "$dir" 2>/dev/null | cut -f1)
+    local bytes; bytes=$(du -sbL "$dir" 2>/dev/null | cut -f1)   # -L: a reused workspace may be a symlink
     jrow row="${R_NAME}_$p" model="$R_NAME" kind=generative runtime=trtllm precision="$p" \
          builder_requested=trtllm builder_used=trtllm serving_dir="$dir" \
          checkpoint="$R_CHECKPOINT" battery="$R_LLM_BATTERY" image="$R_LLM_IMAGE" \
