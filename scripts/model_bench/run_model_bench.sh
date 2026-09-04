@@ -356,6 +356,10 @@ stage3_models() {
       sudo LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" "$NCU_BIN" "${NCU_ARGS[@]}" --log-file "$MDIR/ncu_kernels.csv" \
         "$TRTEXEC_BIN" --loadEngine="$ENGINE" $EXTRA --iterations="$NCU_ITERS" --duration=0 --warmUp=0 --noDataTransfers \
         > "$MDIR/ncu.log" 2>&1 || say "WARN: ncu failed for $NAME (driver perms? try: sudo, check $MDIR/ncu.log)"
+      # with --export ncu logs only the report path: the counter table the parser
+      # reads is rebuilt from the report (same rows as the live print)
+      [ -s "$OUT_DIR/ncu_reports/$NAME.ncu-rep" ] && sudo "$NCU_BIN" --import "$OUT_DIR/ncu_reports/$NAME.ncu-rep" --csv --page details --print-units base \
+        --log-file "$MDIR/ncu_kernels.csv" >/dev/null 2>&1
     else
       say "ncu skipped for $NAME"
     fi
