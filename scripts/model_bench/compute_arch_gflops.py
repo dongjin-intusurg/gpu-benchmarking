@@ -1,92 +1,109 @@
 #!/usr/bin/env python3
-"""Architectural GFLOPs per inference from an ONNX file — the Score's workload constant.
+"""Architectural GFLOPs per inference from an ONNX file - the Score's workload constant.
 
-Counts Conv / Gemm / MatMul (the tensor-core-shaped work) by the naive convention
-(FMA = 2 ops) at the graph's declared input shapes. This is the ARCHITECTURAL count
-for the mix manifest's arch_gflops column — never profiler-measured executed FLOPs.
-
-Usage:
-  python3 compute_arch_gflops.py model.onnx [--shape input_name:1x3x512x640]
-
-Dynamic dims default to 1; override with --shape (repeatable). Output notes what
-fraction of nodes were counted — non-matmul ops (softmax, norm, resize) carry few
-FLOPs and are excluded by convention, matching the pinned mix definition.
+Counts Conv / Gemm / MatMul only (FMA = 2 ops) at the graph's declared shapes; dynamic dims default
+to 1 unless pinned with --shape name:AxBxC (repeatable). Non-matmul ops carry few FLOPs and are
+excluded by convention. Prints 'arch_gflops: X.XX' (parsed by the build scripts) then a coverage note.
 Self-check: gemm_selftest.onnx (4096^3 MatMul) must report 137.44 GFLOPs.
 """
-import sys, argparse
+import argparse
+import sys
+
 import onnx
 from onnx import shape_inference
 
-def dims_of(vi, overrides, default=1):
-    name = vi.name
+
+def dims_of(value_info, overrides, default=1):
     dims = []
-    for d in vi.type.tensor_type.shape.dim:
-        if d.dim_value > 0:
-            dims.append(d.dim_value)
+    for dim in value_info.type.tensor_type.shape.dim:
+        if dim.dim_value > 0:
+            dims.append(dim.dim_value)
         else:
-            dims.append(overrides.get(name, {}).get(len(dims), default))
+            dims.append(overrides.get(value_info.name, {}).get(len(dims), default))
     return dims
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('model')
-    ap.add_argument('--shape', action='append', default=[],
-                    help='name:AxBxC to pin dynamic input dims')
-    a = ap.parse_args()
-    overrides = {}
-    for spec in a.shape:
-        name, dims = spec.rsplit(':', 1)
-        overrides[name] = {i: int(v) for i, v in enumerate(dims.lower().split('x'))}
 
-    m = onnx.load(a.model)
-    try:
-        m = shape_inference.infer_shapes(m)
-    except Exception as e:
-        print(f'WARN: shape inference partial ({e}); dynamic dims default to 1', file=sys.stderr)
-
-    # tensor name -> dims (inputs, initializers, value_info, outputs)
+def tensor_shapes(model, overrides):
+    """tensor name -> dims over inputs, value_info, outputs and initializers."""
     shapes = {}
-    for vi in list(m.graph.input) + list(m.graph.value_info) + list(m.graph.output):
-        shapes[vi.name] = dims_of(vi, overrides)
-    for init in m.graph.initializer:
-        shapes[init.name] = list(init.dims)
+    for value_info in list(model.graph.input) + list(model.graph.value_info) + list(model.graph.output):
+        shapes[value_info.name] = dims_of(value_info, overrides)
+    for initializer in model.graph.initializer:
+        shapes[initializer.name] = list(initializer.dims)
+    return shapes
+
+
+def conv_flops(node, shapes):
+    weight = shapes[node.input[1]]      # [Cout, Cin/g, kh, kw]
+    output = shapes[node.output[0]]     # [N, Cout, Ho, Wo]
+    spatial_out = 1
+    for dim in output[2:]:
+        spatial_out *= dim
+    kernel = 1
+    for dim in weight[1:]:
+        kernel *= dim
+    return 2.0 * output[0] * weight[0] * kernel * spatial_out
+
+
+def matmul_flops(node, shapes):
+    a_shape, b_shape = shapes[node.input[0]], shapes[node.input[1]]
+    if node.op_type == 'Gemm':
+        m, k = a_shape[-2], a_shape[-1]
+        for attribute in node.attribute:
+            if attribute.name == 'transA' and attribute.i:
+                m, k = k, m
+        n = b_shape[-1]
+        for attribute in node.attribute:
+            if attribute.name == 'transB' and attribute.i:
+                n = b_shape[-2]
+        batch = 1
+    else:
+        m, k, n = a_shape[-2], a_shape[-1], b_shape[-1]
+        batch = 1
+        for dim in a_shape[:-2]:
+            batch *= dim
+    return 2.0 * batch * m * k * n
+
+
+def parse_shape_overrides(specs):
+    overrides = {}
+    for spec in specs:
+        name, dims = spec.rsplit(':', 1)
+        overrides[name] = {i: int(value) for i, value in enumerate(dims.lower().split('x'))}
+    return overrides
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('model')
+    parser.add_argument('--shape', action='append', default=[], help='name:AxBxC to pin dynamic input dims')
+    args = parser.parse_args()
+    overrides = parse_shape_overrides(args.shape)
+
+    model = onnx.load(args.model)
+    try:
+        model = shape_inference.infer_shapes(model)
+    except Exception as exc:
+        print(f'WARN: shape inference partial ({exc}); dynamic dims default to 1', file=sys.stderr)
+    shapes = tensor_shapes(model, overrides)
 
     total = 0.0
     counted, skipped = 0, 0
-    for node in m.graph.node:
+    for node in model.graph.node:
         try:
             if node.op_type == 'Conv':
-                w = shapes[node.input[1]]                 # [Cout, Cin/g, kh, kw]
-                out = shapes[node.output[0]]              # [N, Cout, Ho, Wo]
-                spatial_out = 1
-                for d in out[2:]: spatial_out *= d
-                kernel = 1
-                for d in w[1:]: kernel *= d               # Cin/g * kh * kw
-                total += 2.0 * out[0] * w[0] * kernel * spatial_out
+                total += conv_flops(node, shapes)
                 counted += 1
             elif node.op_type in ('Gemm', 'MatMul'):
-                A, B = shapes[node.input[0]], shapes[node.input[1]]
-                if node.op_type == 'Gemm':
-                    M, K = A[-2], A[-1]
-                    for at in node.attribute:
-                        if at.name == 'transA' and at.i: M, K = K, M
-                    N = B[-1]
-                    for at in node.attribute:
-                        if at.name == 'transB' and at.i: N = B[-2]
-                    batch = 1
-                else:
-                    M, K, N = A[-2], A[-1], B[-1]
-                    batch = 1
-                    for d in A[:-2]: batch *= d
-                total += 2.0 * batch * M * K * N
+                total += matmul_flops(node, shapes)
                 counted += 1
         except (KeyError, IndexError):
             skipped += 1
-    n_all = len(m.graph.node)
-    print(f'arch_gflops: {total/1e9:.2f}')
-    print(f'(counted {counted} Conv/Gemm/MatMul nodes of {n_all} total; '
+    print(f'arch_gflops: {total / 1e9:.2f}')
+    print(f'(counted {counted} Conv/Gemm/MatMul nodes of {len(model.graph.node)} total; '
           f'{skipped} matmul-type nodes skipped for missing shapes — '
           f'if skipped > 0, pin shapes with --shape)')
+
 
 if __name__ == '__main__':
     main()

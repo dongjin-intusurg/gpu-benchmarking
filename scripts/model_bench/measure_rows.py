@@ -1,410 +1,619 @@
 #!/usr/bin/env python3
 """Row plumbing for measure_models.sh - everything that is parsing, not running.
 
-  select  --rows-dir D [--only m]... [--kind K]        -> JSON list (or --shell lines)
-  mix     --rows-dir D [--only m]... --out mix.csv     -> the 7-column mix of engine rows
-  e2e     --row R --jsonl F --vram V --out rows.json   -> <model>_e2e + <model>_decode rows
-  edgellm --row R --bench-dir D [--profile P] --vram V --out rows.json
-  trtllm  --row R --sweep S --vram V --out rows.json
+  select  --rows-dir D [--only m]... [--kind K]        -> JSON list (or --shell lines / --table)
+  mix     --rows-dir D [--only m]... --out mix.csv     -> the 7-column mix of engine rows; prints the count
+  e2e / edgellm / trtllm  --row R ... --vram V --out rows.json  -> compute_budgets.py input rows
   merge   --budgets B [--engine-results E] --provenance P --out results.json --report report.md
-
-The row dicts written by e2e/edgellm/trtllm are compute_budgets.py inputs:
-name, latency_ms (the latency of record), hz, deadline_ms, arch_gflops,
-bytes_per_frame_MB (or None + bytes_source), vram_mb, latency_source, plus
-the detail block a reader needs to trust the number.
+Every row carries name, latency_ms (the latency of record), hz, deadline_ms, arch_gflops,
+bytes_per_frame_MB (or None + bytes_source), vram_mb, latency_source, plus a detail block.
 """
-import argparse, glob, json, os, re, shlex, statistics as st, sys
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import statistics
+import sys
+
+# Spec rate for the generative rows is not fixed yet: MODEL_HZ is a placeholder. Every generative /
+# e2e row therefore also carries N at this rate grid plus the highest rate the row sustains solo at
+# N >= 1, so the verdict can be read off once the rate is decided (compute_budgets.py scores the grid).
+HZ_GRID = [1, 2, 5, 10, 20, 30]
 
 
 def load_rows(rows_dir, only=(), kind=None):
     rows = []
-    for f in sorted(glob.glob(os.path.join(rows_dir, '*.jsonl'))):
-        model = os.path.basename(f)[:-6]
+    for path in sorted(glob.glob(os.path.join(rows_dir, '*.jsonl'))):
+        model = os.path.basename(path)[:-6]
         if only and model not in only:
             continue
-        for line in open(f):
+        for line in open(path):
             line = line.strip()
             if not line:
                 continue
-            r = json.loads(line)
-            if kind and r.get('kind') != kind:
+            row = json.loads(line)
+            if kind and row.get('kind') != kind:
                 continue
-            rows.append(r)
+            rows.append(row)
     return rows
 
 
-def pctl(v, p):
-    v = sorted(v)
-    if not v:
+def percentile(values, fraction):
+    values = sorted(values)
+    if not values:
         return None
-    return v[min(len(v) - 1, int(round(p * (len(v) - 1))))]
+    return values[min(len(values) - 1, int(round(fraction * (len(values) - 1))))]
+
+
+def median_if_present(records, key):
+    if not all(key in record for record in records):
+        return None
+    return statistics.median([record[key] for record in records])
 
 
 def read_vram(path):
     try:
-        d = json.load(open(path))
-        return d.get('peak_mb'), d.get('source')
+        sample = json.load(open(path))
+        return sample.get('peak_mb'), sample.get('source')
     except Exception:
         return None, 'none'
 
 
 def read_drift(path):
-    """drift_report.py verdict for the row window -> the clock_integrity block the
-    engine rows carry; a FAIL invalidates the row (measurement_valid False)."""
+    """drift_report.py verdict for the row window -> the clock_integrity block the engine rows
+    carry; a FAIL invalidates the row (measurement_valid False)."""
     try:
-        d = json.load(open(path))
+        drift = json.load(open(path))
     except Exception:
         return {'verdict': None, 'note': 'drift.json missing - no under-load clock evidence recorded'}, True
-    ci = {'verdict': d.get('verdict'), 'pct_at_target': d.get('pct_at_target'),
-          'reference_clock_mhz': d.get('reference_clock_mhz'),
-          'throttle_reasons_seen': d.get('throttle_reasons_seen', d.get('throttle_reasons')),
-          'clamp_events': d.get('clamp_events', d.get('clamp_event_count', d.get('oc_clamp_events')))}
-    return ci, ci['verdict'] != 'FAIL'
+    integrity = {'verdict': drift.get('verdict'), 'pct_at_target': drift.get('pct_at_target'),
+                 'reference_clock_mhz': drift.get('reference_clock_mhz'),
+                 'throttle_reasons_seen': drift.get('throttle_reasons_seen', drift.get('throttle_reasons')),
+                 'clamp_events': drift.get('clamp_events',
+                                           drift.get('clamp_event_count', drift.get('oc_clamp_events')))}
+    return integrity, integrity['verdict'] != 'FAIL'
 
 
 def stamp_rows(rows, drift_path):
-    ci, ok = read_drift(drift_path)
-    for r in rows:
-        r['clock_integrity'] = ci
-        r['measurement_valid'] = ok
+    integrity, valid = read_drift(drift_path)
+    for row in rows:
+        row['clock_integrity'] = integrity
+        row['measurement_valid'] = valid
     return rows
 
 
-# ---------------------------------------------------------------- select / mix
-def cmd_select(a):
-    rows = load_rows(a.rows_dir, a.only, a.kind)
-    if a.table:
-        for r in rows:
-            what = {'engine': r.get('engine'), 'e2e': r.get('src'),
-                    'generative': r.get('llm_dir') or r.get('serving_dir')}.get(r.get('kind'), '')
-            print(f"{r['row']:32} {r.get('kind',''):10} {str(r.get('precision','')):8} "
-                  f"{r.get('runtime','tensorrt'):9} hz={r.get('hz')} deadline={r.get('deadline_ms')}  {what}")
-    elif a.shell:
-        for r in rows:
-            print(' '.join(f'{k.upper()}={shlex.quote(str("" if v is None else v))}' for k, v in r.items()
-                           if isinstance(v, (str, int, float, bool)) or v is None))
+def write_rows(rows, args):
+    json.dump(stamp_rows(rows, args.drift), open(args.out, 'w'), indent=1)
+
+
+def table_line(row):
+    what = {'engine': row.get('engine'), 'e2e': row.get('src'),
+            'generative': row.get('llm_dir') or row.get('serving_dir')}.get(row.get('kind'), '')
+    return (f"{row['row']:32} {row.get('kind', ''):10} {str(row.get('precision', '')):8} "
+            f"{row.get('runtime', 'tensorrt'):9} hz={row.get('hz')} deadline={row.get('deadline_ms')}  "
+            f"{what}")
+
+
+def shell_line(row):
+    """KEY=value pairs for `eval`; nested fields are not exportable and are skipped."""
+    pairs = []
+    for key, value in row.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            pairs.append(f'{key.upper()}={shlex.quote(str("" if value is None else value))}')
+    return ' '.join(pairs)
+
+
+def cmd_select(args):
+    rows = load_rows(args.rows_dir, args.only, args.kind)
+    if args.table:
+        for row in rows:
+            print(table_line(row))
+    elif args.shell:
+        for row in rows:
+            print(shell_line(row))
     else:
         print(json.dumps(rows, indent=1))
 
 
-def cmd_mix(a):
-    rows = load_rows(a.rows_dir, a.only, 'engine')
-    with open(a.out, 'w') as f:
-        f.write('name,onnx,precision,hz,deadline_ms,arch_gflops,extra\n')
-        for r in rows:
-            f.write(f"{r['row']},{r['engine']},{r['precision']},{r['hz']},{r['deadline_ms']},"
-                    f"{r.get('arch_gflops') or 0},{r.get('run_flags') or ''}\n")
+def cmd_mix(args):
+    rows = load_rows(args.rows_dir, args.only, 'engine')
+    with open(args.out, 'w') as out:
+        out.write('name,onnx,precision,hz,deadline_ms,arch_gflops,extra\n')
+        for row in rows:
+            out.write(f"{row['row']},{row['engine']},{row['precision']},{row['hz']},{row['deadline_ms']},"
+                      f"{row.get('arch_gflops') or 0},{row.get('run_flags') or ''}\n")
     print(len(rows))
 
 
-# ------------------------------------------------------------------------ e2e
-def cmd_e2e(a):
-    r = json.load(open(a.row))
-    recs = [json.loads(l) for l in open(a.jsonl) if l.strip()]
-    if not recs:
-        sys.exit(f'{a.jsonl}: the driver wrote no records')
-    need = ('ttft_ms', 'decode_ms_p99', 'gpu_total_ms', 'wall_ms')
-    miss = [k for k in need if any(k not in x for x in recs)]
-    if miss:
-        sys.exit(f'{a.jsonl}: records lack required fields {miss} (the e2e contract needs {need})')
-    vram, vsrc = read_vram(a.vram)
-    tot = [x['gpu_total_ms'] for x in recs]
-    secs = [x.get('seconds') for x in recs if x.get('seconds')]
-    toks = [x.get('n_tokens') for x in recs if x.get('n_tokens')]
-    model = r['model']
-    hz = float(r.get('hz') or 0)
-    dl = float(r.get('deadline_ms') or r.get('model_deadline_ms') or 0)
-    detail = {'clips': len({x.get('clip') for x in recs}), 'records': len(recs), 'repeats': r.get('repeats'),
-              'ttft_ms_median': st.median([x['ttft_ms'] for x in recs]),
-              'ttft_ms_p99': pctl([x['ttft_ms'] for x in recs], .99),
-              'encoder_ms_median': st.median([x['encoder_ms'] for x in recs]) if all('encoder_ms' in x for x in recs) else None,
-              'first_step_ms_median': st.median([x['first_step_ms'] for x in recs]) if all('first_step_ms' in x for x in recs) else None,
-              'decode_ms_median': st.median([x['decode_ms_median'] for x in recs]) if all('decode_ms_median' in x for x in recs) else None,
-              'decode_ms_p99_max': max(x['decode_ms_p99'] for x in recs),
-              'gpu_total_ms_median': st.median(tot), 'gpu_total_ms_p99': pctl(tot, .99),
-              'wall_ms_median': st.median([x['wall_ms'] for x in recs]),
-              'rtf_wall_median': st.median([x['rtf_wall'] for x in recs]) if all('rtf_wall' in x for x in recs) else None,
-              'speech_tokens_per_s': (sum(toks) / sum(secs)) if secs and toks and len(secs) == len(toks) else None,
-              'jsonl': a.jsonl}
-    rows = [{'name': f'{model}_e2e', 'kind': 'e2e', 'precision': r.get('precision'), 'runtime': 'tensorrt-cpp-driver',
-             'latency_ms': detail['gpu_total_ms_p99'], 'latency_source': 'e2e-gpu-total-p99',
-             'hz': hz, 'deadline_ms': dl, 'arch_gflops': float(r.get('arch_gflops') or 0),
-             'bytes_per_frame_MB': None, 'bytes_source': 'none (no per-request byte counter for a multi-engine driver)',
-             'vram_mb': vram, 'vram_source': vsrc, 'e2e': detail},
-            # the decode loop is the row the per-token deadline judges: p99 of
-            # one decode step, charged at the speech-rate token demand
-            {'name': f'{model}_decode', 'kind': 'e2e', 'precision': r.get('precision'), 'runtime': 'tensorrt-cpp-driver',
-             'latency_ms': detail['decode_ms_p99_max'], 'latency_source': 'e2e-decode-step-p99 (max over clips)',
-             'hz': round(detail['speech_tokens_per_s'], 3) if detail['speech_tokens_per_s'] else 0.0,
-             'hz_source': 'measured speech token rate (sum tokens / sum clip seconds)',
-             'deadline_ms': float(r.get('model_deadline_ms') or dl), 'arch_gflops': 0.0,
-             'bytes_per_frame_MB': None, 'bytes_source': 'none',
-             'vram_mb': vram, 'vram_source': vsrc,
-             'e2e': {'decode_ms_median': detail['decode_ms_median'], 'decode_ms_p99_max': detail['decode_ms_p99_max'],
-                     'ttft_ms_median': detail['ttft_ms_median'], 'jsonl': a.jsonl}}]
-    json.dump(stamp_rows(rows, a.drift), open(a.out, 'w'), indent=1)
-    print(f"  {rows[0]['name']:26} gpu_total p99 {rows[0]['latency_ms']:.3f} ms  ttft {detail['ttft_ms_median']:.1f}  rtf {detail['rtf_wall_median']}")
-    print(f"  {rows[1]['name']:26} decode step p99 {rows[1]['latency_ms']:.3f} ms  at {rows[1]['hz']} tok/s")
+def e2e_detail(records, spec, jsonl_path):
+    totals = [record['gpu_total_ms'] for record in records]
+    seconds = [record.get('seconds') for record in records if record.get('seconds')]
+    tokens = [record.get('n_tokens') for record in records if record.get('n_tokens')]
+    speech_tokens_per_s = None
+    if seconds and tokens and len(seconds) == len(tokens):
+        speech_tokens_per_s = sum(tokens) / sum(seconds)
+    return {'clips': len({record.get('clip') for record in records}), 'records': len(records),
+            'repeats': spec.get('repeats'),
+            'ttft_ms_median': statistics.median([record['ttft_ms'] for record in records]),
+            'ttft_ms_p99': percentile([record['ttft_ms'] for record in records], .99),
+            'encoder_ms_median': median_if_present(records, 'encoder_ms'),
+            'first_step_ms_median': median_if_present(records, 'first_step_ms'),
+            'decode_ms_median': median_if_present(records, 'decode_ms_median'),
+            'decode_ms_p99_max': max(record['decode_ms_p99'] for record in records),
+            'gpu_total_ms_median': statistics.median(totals), 'gpu_total_ms_p99': percentile(totals, .99),
+            'wall_ms_median': statistics.median([record['wall_ms'] for record in records]),
+            'rtf_wall_median': median_if_present(records, 'rtf_wall'),
+            'speech_tokens_per_s': speech_tokens_per_s,
+            'jsonl': jsonl_path}
 
 
-# Spec rate for the generative rows is not fixed yet: MODEL_HZ is a placeholder.
-# Every generative / e2e row therefore also carries N at this rate grid plus the
-# highest rate the row sustains solo at N >= 1, so the verdict can be read off
-# once the rate is decided (compute_budgets.py scores the grid).
-HZ_GRID = [1, 2, 5, 10, 20, 30]
+def cmd_e2e(args):
+    spec = json.load(open(args.row))
+    records = [json.loads(line) for line in open(args.jsonl) if line.strip()]
+    if not records:
+        sys.exit(f'{args.jsonl}: the driver wrote no records')
+    required = ('ttft_ms', 'decode_ms_p99', 'gpu_total_ms', 'wall_ms')
+    missing = [key for key in required if any(key not in record for record in records)]
+    if missing:
+        sys.exit(f'{args.jsonl}: records lack required fields {missing} (the e2e contract needs {required})')
+    vram_mb, vram_source = read_vram(args.vram)
+    model = spec['model']
+    hz = float(spec.get('hz') or 0)
+    deadline_ms = float(spec.get('deadline_ms') or spec.get('model_deadline_ms') or 0)
+    detail = e2e_detail(records, spec, args.jsonl)
+    speech_rate = detail['speech_tokens_per_s']
+    step_row = {'name': f'{model}_e2e', 'kind': 'e2e', 'precision': spec.get('precision'),
+                'runtime': 'tensorrt-cpp-driver',
+                'latency_ms': detail['gpu_total_ms_p99'], 'latency_source': 'e2e-gpu-total-p99',
+                'hz': hz, 'deadline_ms': deadline_ms, 'arch_gflops': float(spec.get('arch_gflops') or 0),
+                'bytes_per_frame_MB': None,
+                'bytes_source': 'none (no per-request byte counter for a multi-engine driver)',
+                'vram_mb': vram_mb, 'vram_source': vram_source, 'e2e': detail}
+    # the decode loop is the row the per-token deadline judges: p99 of one decode step, charged at
+    # the speech-rate token demand
+    decode_row = {'name': f'{model}_decode', 'kind': 'e2e', 'precision': spec.get('precision'),
+                  'runtime': 'tensorrt-cpp-driver',
+                  'latency_ms': detail['decode_ms_p99_max'],
+                  'latency_source': 'e2e-decode-step-p99 (max over clips)',
+                  'hz': round(speech_rate, 3) if speech_rate else 0.0,
+                  'hz_source': 'measured speech token rate (sum tokens / sum clip seconds)',
+                  'deadline_ms': float(spec.get('model_deadline_ms') or deadline_ms), 'arch_gflops': 0.0,
+                  'bytes_per_frame_MB': None, 'bytes_source': 'none',
+                  'vram_mb': vram_mb, 'vram_source': vram_source,
+                  'e2e': {'decode_ms_median': detail['decode_ms_median'],
+                          'decode_ms_p99_max': detail['decode_ms_p99_max'],
+                          'ttft_ms_median': detail['ttft_ms_median'], 'jsonl': args.jsonl}}
+    write_rows([step_row, decode_row], args)
+    print(f"  {step_row['name']:26} gpu_total p99 {step_row['latency_ms']:.3f} ms  "
+          f"ttft {detail['ttft_ms_median']:.1f}  rtf {detail['rtf_wall_median']}")
+    print(f"  {decode_row['name']:26} decode step p99 {decode_row['latency_ms']:.3f} ms  "
+          f"at {decode_row['hz']} tok/s")
 
 
-# -------------------------------------------------------------------- edgellm
 def bench_ms(path):
     try:
-        m = re.search(r'E2E Time \(actual performance\): ([0-9.]+)', open(path, errors='ignore').read())
-        return float(m.group(1)) if m else None
+        match = re.search(r'E2E Time \(actual performance\): ([0-9.]+)', open(path, errors='ignore').read())
+        return float(match.group(1)) if match else None
     except FileNotFoundError:
         return None
 
 
-def cmd_edgellm(a):
-    r = json.load(open(a.row))
-    d = a.bench_dir
-    vis = bench_ms(os.path.join(d, 'visual.log')) if r.get('visual_dir') else 0.0
-    pre = bench_ms(os.path.join(d, 'prefill.log'))
-    reuse = bench_ms(os.path.join(d, 'reuse.log'))
-    dec = bench_ms(os.path.join(d, 'decode.log'))
-    if pre is None or dec is None or (r.get('visual_dir') and vis is None):
-        sys.exit(f'{d}: llm_bench output incomplete (visual={vis} prefill={pre} reuse={reuse} decode={dec})')
-    chunk = int(r.get('chunk') or 8)
-    best_pre = min(x for x in (pre, reuse) if x is not None)
-    step = (vis or 0) + best_pre + chunk * dec
-    vram, vsrc = read_vram(a.vram)
-    prof = None
-    if a.profile and os.path.exists(a.profile):
-        p = json.load(open(a.profile))
-        stages = {s['stage_id']: s['gpu_time_stats'] for s in p.get('stages', [])}
-        gen = p.get('generation', {})
-        prof = {'ttft_ms': sum(stages[k]['median_ms'] for k in ('vision_encoder', 'llm_prefill') if k in stages)
-                           + (stages['llm_generation']['median_ms'] if 'llm_generation' in stages else 0),
-                'ttft_basis': 'vision_encoder + llm_prefill + first llm_generation step (stage medians)',
-                'decode_ms_median': stages.get('llm_generation', {}).get('median_ms'),
-                'decode_ms_p99': stages.get('llm_generation', {}).get('p99_ms'),
-                'tokens_per_second': gen.get('tokens_per_second'), 'generated_tokens': gen.get('generated_tokens'),
-                'prefill_ms_median': stages.get('llm_prefill', {}).get('median_ms'),
-                'visual_ms_median': stages.get('vision_encoder', {}).get('median_ms'),
-                'peak_unified_memory_mb': p.get('peak_unified_memory_mb'), 'profile': a.profile, 'stages': stages}
-        if p.get('peak_unified_memory_mb'):
-            vram = max(vram or 0, p['peak_unified_memory_mb']); vsrc = 'edgellm-profile-peak-unified'
-    eb = float(r.get('engine_bytes') or 0) / 1e6; vb = float(r.get('visual_bytes') or 0) / 1e6
-    bytes_mb = eb * (chunk + 1) + vb if eb else None
-    # a resident engine can never occupy less than its own bytes: when the
-    # battery did not run (sampler saw a process that died early) the sampled
-    # delta is meaningless, so the weights are the floor of record
-    if eb and (vram or 0) < eb + vb:
-        vram, vsrc = round(eb + vb, 1), 'engine-bytes-floor (llm + visual engine files; battery peak unavailable)'
-    row = {'name': r['row'], 'kind': 'generative', 'runtime': 'edgellm', 'precision': r['precision'], 'hz_grid': HZ_GRID,
-           'latency_ms': round(step, 3), 'latency_source': f'llm_bench step = visual + best(prefill,reuse) + {chunk} x decode',
-           'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
-           'bytes_per_frame_MB': round(bytes_mb, 1) if bytes_mb else None,
-           'bytes_source': 'weights-stream-estimate: llm engine bytes x (chunk+1) + visual engine bytes (KV traffic excluded - a lower bound)',
-           'vram_mb': vram, 'vram_source': vsrc,
-           'generative': {'visual_ms': vis, 'prefill_ms': pre, 'prefill_reuse_ms': reuse, 'decode_ms': dec,
-                          'tokens_per_s_bench': round(1000.0 / dec, 2), 'chunk': chunk,
-                          'context_len': r.get('context_len'), 'reuse_len': r.get('reuse_len'),
-                          'ttft_ms_bench': round((vis or 0) + best_pre + dec, 2),
-                          'engine_mb': round(eb, 1), 'visual_mb': round(vb, 1), 'e2e': prof}}
-    rows = [row]
-    if prof and prof.get('decode_ms_p99'):
-        # end-to-end rows from the llm_inference battery (real prompts + image,
-        # the runtime's own stage timers): the chunk step at p99 of every stage,
-        # and the decode loop the per-token deadline judges - the same pair the
-        # C++ driver rows produce for the ASR model
-        st = prof['stages']
-        p99 = lambda k: float(st.get(k, {}).get('p99_ms') or 0)
-        step_e2e = p99('vision_encoder') + p99('llm_prefill') + chunk * p99('llm_generation')
-        rows.append({'name': f"{r['row']}_e2e", 'kind': 'e2e', 'runtime': 'edgellm-llm_inference', 'precision': r['precision'],
-                     'latency_ms': round(step_e2e, 3),
-                     'latency_source': f'llm_inference battery step = vision p99 + prefill p99 + {chunk} x decode p99 (stage timers)',
-                     'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
-                     'hz_grid': HZ_GRID, 'bytes_per_frame_MB': row['bytes_per_frame_MB'], 'bytes_source': row['bytes_source'],
-                     'vram_mb': vram, 'vram_source': vsrc,
-                     'e2e': dict(prof, chunk=chunk, step_ms_p99=round(step_e2e, 3), battery=r.get('battery'), image=r.get('image'))})
-        rows.append({'name': f"{r['row']}_decode", 'kind': 'e2e', 'runtime': 'edgellm-llm_inference', 'precision': r['precision'],
-                     'latency_ms': round(prof['decode_ms_p99'], 3), 'latency_source': 'llm_inference battery decode step p99',
-                     # modal: the decode loop runs at its own token rate, not the frame rate
-                     'hz': round(float(prof.get('tokens_per_second') or 0), 3), 'deadline_ms': float(r['deadline_ms']),
-                     'arch_gflops': 0.0, 'hz_grid': HZ_GRID,
-                     'bytes_per_frame_MB': round(eb, 1) if eb else None,
-                     'bytes_source': 'weights-stream-estimate: llm engine bytes per token (KV traffic excluded - a lower bound)',
-                     'vram_mb': vram, 'vram_source': vsrc,
-                     'e2e': {'decode_ms_median': prof.get('decode_ms_median'), 'decode_ms_p99': prof['decode_ms_p99'],
-                             'tokens_per_second': prof.get('tokens_per_second'), 'ttft_ms': prof['ttft_ms']}})
-    json.dump(stamp_rows(rows, a.drift), open(a.out, 'w'), indent=1)
-    print(f"  {row['name']:26} step {step:.1f} ms (vis {vis} + prefill {pre}/{reuse} + {chunk}x{dec})  "
-          f"tok/s {1000/dec:.1f}" + (f"  e2e ttft {prof['ttft_ms']:.1f} tok/s {prof['tokens_per_second']:.1f}" if prof else ''))
+def read_llm_profile(path):
+    """The llm_inference battery profile (real prompts + image, the runtime's own stage timers)."""
+    profile = json.load(open(path))
+    stages = {stage['stage_id']: stage['gpu_time_stats'] for stage in profile.get('stages', [])}
+    generation = profile.get('generation', {})
+    ttft_ms = sum(stages[key]['median_ms'] for key in ('vision_encoder', 'llm_prefill') if key in stages)
+    if 'llm_generation' in stages:
+        ttft_ms += stages['llm_generation']['median_ms']
+    return {'ttft_ms': ttft_ms,
+            'ttft_basis': 'vision_encoder + llm_prefill + first llm_generation step (stage medians)',
+            'decode_ms_median': stages.get('llm_generation', {}).get('median_ms'),
+            'decode_ms_p99': stages.get('llm_generation', {}).get('p99_ms'),
+            'tokens_per_second': generation.get('tokens_per_second'),
+            'generated_tokens': generation.get('generated_tokens'),
+            'prefill_ms_median': stages.get('llm_prefill', {}).get('median_ms'),
+            'visual_ms_median': stages.get('vision_encoder', {}).get('median_ms'),
+            'peak_unified_memory_mb': profile.get('peak_unified_memory_mb'), 'profile': path,
+            'stages': stages}
+
+
+def edgellm_e2e_rows(spec, profile, chunk, step_row, engine_mb):
+    """The battery pair: the chunk step at p99 of every stage, and the decode loop the per-token
+    deadline judges - the same pair the C++ driver rows produce for the ASR model."""
+    stage_stats = profile['stages']
+
+    def stage_p99(key):
+        return float(stage_stats.get(key, {}).get('p99_ms') or 0)
+
+    step_p99 = stage_p99('vision_encoder') + stage_p99('llm_prefill') + chunk * stage_p99('llm_generation')
+    common = {'kind': 'e2e', 'runtime': 'edgellm-llm_inference', 'precision': spec['precision']}
+    e2e_row = {'name': f"{spec['row']}_e2e", **common,
+               'latency_ms': round(step_p99, 3),
+               'latency_source': f'llm_inference battery step = vision p99 + prefill p99 + {chunk} x decode '
+                                 'p99 (stage timers)',
+               'hz': float(spec['hz']), 'deadline_ms': float(spec['deadline_ms']),
+               'arch_gflops': float(spec.get('arch_gflops') or 0),
+               'hz_grid': HZ_GRID, 'bytes_per_frame_MB': step_row['bytes_per_frame_MB'],
+               'bytes_source': step_row['bytes_source'],
+               'vram_mb': step_row['vram_mb'], 'vram_source': step_row['vram_source'],
+               'e2e': dict(profile, chunk=chunk, step_ms_p99=round(step_p99, 3), battery=spec.get('battery'),
+                           image=spec.get('image'))}
+    # modal: the decode loop runs at its own token rate, not the frame rate
+    decode_row = {'name': f"{spec['row']}_decode", **common,
+                  'latency_ms': round(profile['decode_ms_p99'], 3),
+                  'latency_source': 'llm_inference battery decode step p99',
+                  'hz': round(float(profile.get('tokens_per_second') or 0), 3),
+                  'deadline_ms': float(spec['deadline_ms']),
+                  'arch_gflops': 0.0, 'hz_grid': HZ_GRID,
+                  'bytes_per_frame_MB': round(engine_mb, 1) if engine_mb else None,
+                  'bytes_source': 'weights-stream-estimate: llm engine bytes per token (KV traffic '
+                                  'excluded - a lower bound)',
+                  'vram_mb': step_row['vram_mb'], 'vram_source': step_row['vram_source'],
+                  'e2e': {'decode_ms_median': profile.get('decode_ms_median'),
+                          'decode_ms_p99': profile['decode_ms_p99'],
+                          'tokens_per_second': profile.get('tokens_per_second'),
+                          'ttft_ms': profile['ttft_ms']}}
+    return [e2e_row, decode_row]
+
+
+def cmd_edgellm(args):
+    spec = json.load(open(args.row))
+    bench_dir = args.bench_dir
+    has_visual = bool(spec.get('visual_dir'))
+    visual_ms = bench_ms(os.path.join(bench_dir, 'visual.log')) if has_visual else 0.0
+    prefill_ms = bench_ms(os.path.join(bench_dir, 'prefill.log'))
+    reuse_ms = bench_ms(os.path.join(bench_dir, 'reuse.log'))
+    decode_ms = bench_ms(os.path.join(bench_dir, 'decode.log'))
+    if prefill_ms is None or decode_ms is None or (has_visual and visual_ms is None):
+        sys.exit(f'{bench_dir}: llm_bench output incomplete (visual={visual_ms} prefill={prefill_ms} '
+                 f'reuse={reuse_ms} decode={decode_ms})')
+    chunk = int(spec.get('chunk') or 8)
+    best_prefill_ms = min(value for value in (prefill_ms, reuse_ms) if value is not None)
+    step_ms = (visual_ms or 0) + best_prefill_ms + chunk * decode_ms
+    vram_mb, vram_source = read_vram(args.vram)
+    profile = None
+    if args.profile and os.path.exists(args.profile):
+        profile = read_llm_profile(args.profile)
+        if profile['peak_unified_memory_mb']:
+            vram_mb = max(vram_mb or 0, profile['peak_unified_memory_mb'])
+            vram_source = 'edgellm-profile-peak-unified'
+    engine_mb = float(spec.get('engine_bytes') or 0) / 1e6
+    visual_mb = float(spec.get('visual_bytes') or 0) / 1e6
+    bytes_mb = engine_mb * (chunk + 1) + visual_mb if engine_mb else None
+    # a resident engine can never occupy less than its own bytes: when the battery did not run
+    # (sampler saw a process that died early) the sampled delta is meaningless, so the weights
+    # are the floor of record
+    if engine_mb and (vram_mb or 0) < engine_mb + visual_mb:
+        vram_mb = round(engine_mb + visual_mb, 1)
+        vram_source = 'engine-bytes-floor (llm + visual engine files; battery peak unavailable)'
+    step_row = {'name': spec['row'], 'kind': 'generative', 'runtime': 'edgellm',
+                'precision': spec['precision'], 'hz_grid': HZ_GRID,
+                'latency_ms': round(step_ms, 3),
+                'latency_source': f'llm_bench step = visual + best(prefill,reuse) + {chunk} x decode',
+                'hz': float(spec['hz']), 'deadline_ms': float(spec['deadline_ms']),
+                'arch_gflops': float(spec.get('arch_gflops') or 0),
+                'bytes_per_frame_MB': round(bytes_mb, 1) if bytes_mb else None,
+                'bytes_source': 'weights-stream-estimate: llm engine bytes x (chunk+1) + visual engine bytes '
+                                '(KV traffic excluded - a lower bound)',
+                'vram_mb': vram_mb, 'vram_source': vram_source,
+                'generative': {'visual_ms': visual_ms, 'prefill_ms': prefill_ms, 'prefill_reuse_ms': reuse_ms,
+                               'decode_ms': decode_ms,
+                               'tokens_per_s_bench': round(1000.0 / decode_ms, 2), 'chunk': chunk,
+                               'context_len': spec.get('context_len'), 'reuse_len': spec.get('reuse_len'),
+                               'ttft_ms_bench': round((visual_ms or 0) + best_prefill_ms + decode_ms, 2),
+                               'engine_mb': round(engine_mb, 1), 'visual_mb': round(visual_mb, 1),
+                               'e2e': profile}}
+    rows = [step_row]
+    if profile and profile.get('decode_ms_p99'):
+        rows += edgellm_e2e_rows(spec, profile, chunk, step_row, engine_mb)
+    write_rows(rows, args)
+    battery_note = ''
+    if profile:
+        battery_note = f"  e2e ttft {profile['ttft_ms']:.1f} tok/s {profile['tokens_per_second']:.1f}"
+    print(f"  {step_row['name']:26} step {step_ms:.1f} ms (vis {visual_ms} + prefill {prefill_ms}/{reuse_ms} "
+          f"+ {chunk}x{decode_ms})  tok/s {1000 / decode_ms:.1f}" + battery_note)
     if len(rows) > 1:
-        print(f"  {rows[1]['name']:26} e2e step p99 {rows[1]['latency_ms']:.1f} ms   {rows[2]['name']:26} decode p99 {rows[2]['latency_ms']:.2f} ms at {rows[2]['hz']} tok/s")
+        print(f"  {rows[1]['name']:26} e2e step p99 {rows[1]['latency_ms']:.1f} ms   "
+              f"{rows[2]['name']:26} decode p99 {rows[2]['latency_ms']:.2f} ms at {rows[2]['hz']} tok/s")
 
 
 # --------------------------------------------------------------------- trtllm
-def cmd_trtllm(a):
-    r = json.load(open(a.row))
-    s = json.load(open(a.sweep))
-    chunk = str(r.get('chunk') or 8)
-    c = (s.get('chunks') or {}).get(chunk) or {}
-    comp = s.get('compose') or {}
-    if not c.get('total_ms_p99'):
-        sys.exit(f'{a.sweep}: no chunk-{chunk} pass with total_ms_p99')
-    vram, vsrc = read_vram(a.vram)
-    eb = float(r.get('engine_bytes') or 0) / 1e6
-    row = {'name': r['row'], 'kind': 'generative', 'runtime': 'trtllm', 'precision': r['precision'], 'hz_grid': HZ_GRID,
-           'latency_ms': c['total_ms_p99'], 'latency_source': f'RequestPerfMetrics total_ms p99, chunk {chunk} (reuse on)',
-           'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
-           'bytes_per_frame_MB': round(eb * (int(chunk) + 1), 1) if eb else None,
-           'bytes_source': 'weights-stream-estimate: checkpoint bytes x (chunk+1) (KV traffic excluded - a lower bound)',
-           'vram_mb': vram, 'vram_source': vsrc,
-           'generative': {'ttft_ms': comp.get('ttft_ms'), 'prefill_reuse_ms': comp.get('prefill_reuse_ms'),
-                          'prefill_cold_ms': comp.get('prefill_cold_ms'), 'decode_ms': comp.get('decode_ms'),
-                          'tokens_per_s_bench': round(1000.0 / comp['decode_ms'], 2) if comp.get('decode_ms') else None,
-                          'step_ms_p50': c.get('total_ms_p50'), 'n': c.get('n'), 'chunk': int(chunk), 'sweep': a.sweep}}
+def trtllm_side_rows(spec, row, chunk, compose, engine_mb, vram_mb, vram_source):
+    """The <row>_e2e / <row>_decode pair every generative runtime exports, so a TensorRT-LLM model
+    can be a stage-5 side row: the measured chunk step (what the deadline judges) and the per-token
+    decode loop at its own token rate."""
+    decode_ms = float(compose['decode_ms'])
+    step_row = {'name': f"{spec['row']}_e2e", 'kind': 'e2e', 'runtime': 'trtllm', 'precision': spec['precision'],
+                'latency_ms': row['latency_ms'],
+                'latency_source': f'RequestPerfMetrics total_ms p99, chunk {chunk} (reuse on) - the measured step',
+                'hz': float(spec['hz']), 'deadline_ms': float(spec['deadline_ms']),
+                'arch_gflops': float(spec.get('arch_gflops') or 0),
+                'hz_grid': HZ_GRID, 'bytes_per_frame_MB': row['bytes_per_frame_MB'],
+                'bytes_source': row['bytes_source'],
+                'vram_mb': vram_mb, 'vram_source': vram_source,
+                'e2e': dict(row['generative'], chunk=int(chunk), step_ms_p99=row['latency_ms'],
+                            image=spec.get('image'))}
+    decode_row = {'name': f"{spec['row']}_decode", 'kind': 'e2e', 'runtime': 'trtllm',
+                  'precision': spec['precision'],
+                  'latency_ms': round(decode_ms, 3),
+                  'latency_source': 'RequestPerfMetrics decode ms/token (sweep, reuse on)',
+                  'hz': round(1000.0 / decode_ms, 3), 'deadline_ms': float(spec['deadline_ms']),
+                  'arch_gflops': 0.0, 'hz_grid': HZ_GRID,
+                  'bytes_per_frame_MB': round(engine_mb, 1) if engine_mb else None,
+                  'bytes_source': 'weights-stream-estimate: checkpoint bytes per token (KV traffic excluded - '
+                                  'a lower bound)',
+                  'vram_mb': vram_mb, 'vram_source': vram_source,
+                  'e2e': {'decode_ms': decode_ms, 'tokens_per_second': round(1000.0 / decode_ms, 2),
+                          'ttft_ms': compose.get('ttft_ms')}}
+    return [step_row, decode_row]
+
+
+def cmd_trtllm(args):
+    spec = json.load(open(args.row))
+    sweep = json.load(open(args.sweep))
+    chunk = str(spec.get('chunk') or 8)
+    chunk_pass = (sweep.get('chunks') or {}).get(chunk) or {}
+    compose = sweep.get('compose') or {}
+    if not chunk_pass.get('total_ms_p99'):
+        sys.exit(f'{args.sweep}: no chunk-{chunk} pass with total_ms_p99')
+    vram_mb, vram_source = read_vram(args.vram)
+    engine_mb = float(spec.get('engine_bytes') or 0) / 1e6
+    decode_ms = compose.get('decode_ms')
+    row = {'name': spec['row'], 'kind': 'generative', 'runtime': 'trtllm', 'precision': spec['precision'],
+           'hz_grid': HZ_GRID,
+           'latency_ms': chunk_pass['total_ms_p99'],
+           'latency_source': f'RequestPerfMetrics total_ms p99, chunk {chunk} (reuse on)',
+           'hz': float(spec['hz']), 'deadline_ms': float(spec['deadline_ms']),
+           'arch_gflops': float(spec.get('arch_gflops') or 0),
+           'bytes_per_frame_MB': round(engine_mb * (int(chunk) + 1), 1) if engine_mb else None,
+           'bytes_source': 'weights-stream-estimate: checkpoint bytes x (chunk+1) (KV traffic excluded - '
+                           'a lower bound)',
+           'vram_mb': vram_mb, 'vram_source': vram_source,
+           'generative': {'ttft_ms': compose.get('ttft_ms'),
+                          'prefill_reuse_ms': compose.get('prefill_reuse_ms'),
+                          'prefill_cold_ms': compose.get('prefill_cold_ms'), 'decode_ms': decode_ms,
+                          'tokens_per_s_bench': round(1000.0 / decode_ms, 2) if decode_ms else None,
+                          'step_ms_p50': chunk_pass.get('total_ms_p50'), 'n': chunk_pass.get('n'),
+                          'chunk': int(chunk), 'sweep': args.sweep}}
     rows = [row]
-    if comp.get('decode_ms'):
-        # the same <row>_e2e / <row>_decode pair the Edge-LLM battery and the C++
-        # driver rows produce, so a TensorRT-LLM model can be a stage-5 side row:
-        # the measured chunk step (what the deadline judges) and the per-token
-        # decode loop at its own token rate
-        dec = float(comp['decode_ms'])
-        rows.append({'name': f"{r['row']}_e2e", 'kind': 'e2e', 'runtime': 'trtllm', 'precision': r['precision'],
-                     'latency_ms': row['latency_ms'],
-                     'latency_source': f'RequestPerfMetrics total_ms p99, chunk {chunk} (reuse on) - the measured step',
-                     'hz': float(r['hz']), 'deadline_ms': float(r['deadline_ms']), 'arch_gflops': float(r.get('arch_gflops') or 0),
-                     'hz_grid': HZ_GRID, 'bytes_per_frame_MB': row['bytes_per_frame_MB'], 'bytes_source': row['bytes_source'],
-                     'vram_mb': vram, 'vram_source': vsrc,
-                     'e2e': dict(row['generative'], chunk=int(chunk), step_ms_p99=row['latency_ms'], image=r.get('image'))})
-        rows.append({'name': f"{r['row']}_decode", 'kind': 'e2e', 'runtime': 'trtllm', 'precision': r['precision'],
-                     'latency_ms': round(dec, 3), 'latency_source': 'RequestPerfMetrics decode ms/token (sweep, reuse on)',
-                     # modal: the decode loop runs at its own token rate, not the frame rate
-                     'hz': round(1000.0 / dec, 3), 'deadline_ms': float(r['deadline_ms']),
-                     'arch_gflops': 0.0, 'hz_grid': HZ_GRID,
-                     'bytes_per_frame_MB': round(eb, 1) if eb else None,
-                     'bytes_source': 'weights-stream-estimate: checkpoint bytes per token (KV traffic excluded - a lower bound)',
-                     'vram_mb': vram, 'vram_source': vsrc,
-                     'e2e': {'decode_ms': dec, 'tokens_per_second': round(1000.0 / dec, 2), 'ttft_ms': comp.get('ttft_ms')}})
-    json.dump(stamp_rows(rows, a.drift), open(a.out, 'w'), indent=1)
-    print(f"  {row['name']:26} step p99 {row['latency_ms']:.1f} ms  ttft {comp.get('ttft_ms')}  decode {comp.get('decode_ms')} ms/tok"
-          + (f"  -> +{rows[1]['name']} / {rows[2]['name']}" if len(rows) > 1 else ''))
+    if decode_ms:
+        rows += trtllm_side_rows(spec, row, chunk, compose, engine_mb, vram_mb, vram_source)
+    write_rows(rows, args)
+    derived = f"  -> +{rows[1]['name']} / {rows[2]['name']}" if len(rows) > 1 else ''
+    print(f"  {row['name']:26} step p99 {row['latency_ms']:.1f} ms  ttft {compose.get('ttft_ms')}  "
+          f"decode {decode_ms} ms/tok" + derived)
 
 
-# ---------------------------------------------------------------------- merge
-def engine_row_summary(m):
-    s = m.get('solo') or {}
-    return {'name': m['name'], 'kind': 'engine', 'runtime': 'tensorrt', 'precision': m.get('precision'),
-            'latency_ms': m.get('p99_ms'), 'latency_source': m.get('p99_source', 'trtexec p99'),
-            'hz': m.get('hz'), 'deadline_ms': m.get('deadline_ms'), 'arch_gflops': m.get('arch_gflops'),
-            'bytes_per_frame_MB': m.get('bytes_per_frame_MB'), 'bytes_source': m.get('bytes_source'),
-            'vram_mb': m.get('vram_budget_mb') or m.get('vram_mb'), 'vram_source': m.get('vram_source'),
-            'solo': s, 'clock_integrity': m.get('clock_integrity'), 'measurement_valid': m.get('measurement_valid')}
+def engine_row_summary(model):
+    return {'name': model['name'], 'kind': 'engine', 'runtime': 'tensorrt',
+            'precision': model.get('precision'),
+            'latency_ms': model.get('p99_ms'), 'latency_source': model.get('p99_source', 'trtexec p99'),
+            'hz': model.get('hz'), 'deadline_ms': model.get('deadline_ms'),
+            'arch_gflops': model.get('arch_gflops'),
+            'bytes_per_frame_MB': model.get('bytes_per_frame_MB'), 'bytes_source': model.get('bytes_source'),
+            'vram_mb': model.get('vram_budget_mb') or model.get('vram_mb'),
+            'vram_source': model.get('vram_source'),
+            'solo': model.get('solo') or {}, 'clock_integrity': model.get('clock_integrity'),
+            'measurement_valid': model.get('measurement_valid')}
 
 
-def cmd_merge(a):
-    B = json.load(open(a.budgets)) if a.budgets and os.path.exists(a.budgets) else {'rows': []}
-    E = json.load(open(a.engine_results)) if a.engine_results and os.path.exists(a.engine_results) else {}
-    prov = json.load(open(a.provenance)) if a.provenance and os.path.exists(a.provenance) else {}
-    rows = [engine_row_summary(m) for m in E.get('models', [])] + list(B.get('rows', []))
-    out = {'suite': E.get('suite', 'per-model-solo'), 'convention': E.get('convention'), 'regime': E.get('regime'),
-           'composition': 'solo (one row at a time; N/C/L per row, never summed across rows)',
-           'device': prov.get('device'), 'platform': prov.get('platform'), 'device_tag': prov.get('device_tag'),
-           'provenance': prov,
-           'preflight': E.get('preflight'), 'clock_integrity': E.get('clock_integrity'),
-           'ceilings': E.get('ceilings'), 'bw_ceiling_source': E.get('bw_ceiling_source') or B.get('bw_ceiling_source'),
-           'bw_eff_gbps': B.get('bw_eff_gbps'),
-           'vram_capacity_mb': E.get('vram_capacity_mb') or B.get('vram_capacity_mb'),
-           'vram_capacity_source': E.get('vram_capacity_source') or B.get('vram_capacity_source'),
-           'engine_rows_results': a.engine_results,
-           'rows': rows,
-           # the per-engine block keeps its full schema for the existing readers
-           'models': E.get('models', []) + [dict(r, p99_ms=r.get('latency_ms'), p99_source=r.get('latency_source'))
-                                             for r in B.get('rows', [])]}
-    for k in ('U_max', 'C', 'L', 'N', 'shortfall_cause_if_N_lt_1', 'workload_constant_gflops_per_s', 'score_tflops_at_deadline',
-              'budgets', 'binding_budget', 'bw_demand_is_upper_bound'):
-        if k in E:
-            out[k] = E[k]
-    if 'N' in E:
-        out['device_rollup_scope'] = 'engine rows only (the trtexec mix); generative and e2e rows are solo verdicts'
-    json.dump(out, open(a.out, 'w'), indent=1)
+DEVICE_ROLLUP_KEYS = ('U_max', 'C', 'L', 'N', 'shortfall_cause_if_N_lt_1', 'workload_constant_gflops_per_s',
+                      'score_tflops_at_deadline', 'budgets', 'binding_budget', 'bw_demand_is_upper_bound')
 
-    L = ['# Stage 4 - solo per-model measurement', '',
-         f"device: {prov.get('device')}  platform: {prov.get('platform')}  tag: {prov.get('device_tag')}  "
-         f"date: {prov.get('date')}", f"ceilings: {prov.get('ceilings_json')}",
-         f"bw_eff {out.get('bw_eff_gbps')} GB/s ({out.get('bw_ceiling_source')})  vram cap {out.get('vram_capacity_mb')} MB ({out.get('vram_capacity_source')})",
-         '', 'N = min(L, C); C = 1/U_max over time, DRAM-bandwidth and VRAM budgets; L = deadline / latency of record.',
-         'cause: latency-limited (L < C, needs faster silicon) vs throughput-limited (C < L, buyable with capacity).', '',
-         '| row | kind | prec | latency ms | source | hz | deadline | U_max | C | L | N | cause | budget |',
-         '|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|---|']
-    for r in rows:
-        s = r.get('solo') or {}
-        if not s:
-            L.append(f"| {r['name']} | {r.get('kind')} | {r.get('precision')} | {r.get('latency_ms')} | {r.get('latency_source','')} | "
-                     f"{r.get('hz')} | {r.get('deadline_ms')} | - | - | - | - | {r.get('error','unscored')} | |")
+
+def merged_results(budgets, engine_results, provenance, rows, engine_results_path):
+    merged = {'suite': engine_results.get('suite', 'per-model-solo'),
+              'convention': engine_results.get('convention'), 'regime': engine_results.get('regime'),
+              'composition': 'solo (one row at a time; N/C/L per row, never summed across rows)',
+              'device': provenance.get('device'), 'platform': provenance.get('platform'),
+              'device_tag': provenance.get('device_tag'),
+              'provenance': provenance,
+              'preflight': engine_results.get('preflight'),
+              'clock_integrity': engine_results.get('clock_integrity'),
+              'ceilings': engine_results.get('ceilings'),
+              'bw_ceiling_source': (engine_results.get('bw_ceiling_source')
+                                    or budgets.get('bw_ceiling_source')),
+              'bw_eff_gbps': budgets.get('bw_eff_gbps'),
+              'vram_capacity_mb': engine_results.get('vram_capacity_mb') or budgets.get('vram_capacity_mb'),
+              'vram_capacity_source': (engine_results.get('vram_capacity_source')
+                                       or budgets.get('vram_capacity_source')),
+              'engine_rows_results': engine_results_path,
+              'rows': rows,
+              # the per-engine block keeps its full schema for the existing readers
+              'models': engine_results.get('models', [])
+              + [dict(row, p99_ms=row.get('latency_ms'), p99_source=row.get('latency_source'))
+                 for row in budgets.get('rows', [])]}
+    for key in DEVICE_ROLLUP_KEYS:
+        if key in engine_results:
+            merged[key] = engine_results[key]
+    if 'N' in engine_results:
+        merged['device_rollup_scope'] = ('engine rows only (the trtexec mix); generative and e2e rows are '
+                                         'solo verdicts')
+    return merged
+
+
+def verdict_table(rows):
+    lines = ['| row | kind | prec | latency ms | source | hz | deadline | U_max | C | L | N | cause | '
+             'budget |',
+             '|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|---|']
+    for row in rows:
+        solo = row.get('solo') or {}
+        prefix = (f"| {row['name']} | {row.get('kind')} | {row.get('precision')} | ")
+        if not solo:
+            lines.append(prefix + f"{row.get('latency_ms')} | {row.get('latency_source', '')} | "
+                         f"{row.get('hz')} | {row.get('deadline_ms')} | - | - | - | - | "
+                         f"{row.get('error', 'unscored')} | |")
             continue
-        comp = 'complete' if s.get('budget_complete', True) else 'incomplete: ' + ','.join(s.get('budgets_not_measured', []))
-        if r.get('measurement_valid') is False:
-            comp += ' INVALID(drift)'
-        L.append(f"| {r['name']} | {r.get('kind')} | {r.get('precision')} | {r.get('latency_ms'):.3f} | {r.get('latency_source','')} | "
-                 f"{r.get('hz')} | {r.get('deadline_ms')} | {s.get('U_max')} | {s.get('C')} | {s.get('L')} | **{s.get('N')}** | {s.get('cause')} | {comp} |")
-    gen = [r for r in rows if r.get('kind') == 'generative']
-    if gen:
-        L += ['', '## Generative rows (TTFT / decode)', '',
-              '| row | runtime | prec | visual ms | prefill ms | reuse ms | decode ms/tok | tok/s | TTFT ms | e2e TTFT ms | e2e tok/s | e2e decode p99 | peak mem MB |',
-              '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
-        for r in gen:
-            g = r.get('generative') or {}; e = g.get('e2e') or {}
-            L.append(f"| {r['name']} | {r.get('runtime')} | {r.get('precision')} | {g.get('visual_ms')} | {g.get('prefill_ms') or g.get('prefill_cold_ms')} | "
-                     f"{g.get('prefill_reuse_ms')} | {g.get('decode_ms')} | {g.get('tokens_per_s_bench')} | {g.get('ttft_ms_bench') or g.get('ttft_ms')} | "
-                     f"{e.get('ttft_ms')} | {e.get('tokens_per_second')} | {e.get('decode_ms_p99')} | {r.get('vram_mb')} |")
-    sweep = [r for r in rows if (r.get('solo') or {}).get('N_vs_hz')]
-    if sweep:
-        grid = list(sweep[0]['solo']['N_vs_hz'].keys())
-        L += ['', '## Rate sweep - generative and e2e rows (spec rate not fixed: MODEL_HZ is a placeholder)', '',
-              'N at each candidate rate with the period (1000/rate) as the deadline and the same measured budgets; '
-              '**max rate @ N>=1** = the highest solo rate the row sustains, and which budget binds there. '
-              'Rates are Hz for step rows and tokens/s for decode rows. Read the verdict off the column once the rate is decided.', '',
-              '| row | latency ms | ' + ' | '.join(f'N@{h}' for h in grid) + ' | max rate @ N>=1 | binds at max |',
-              '|---|---:|' + '---:|' * len(grid) + '---:|---|']
-        for r in sweep:
-            s = r['solo']
-            L.append(f"| {r['name']} | {r['latency_ms']:.1f} | " + ' | '.join(str(s['N_vs_hz'][h]) for h in grid) +
-                     f" | {s.get('max_hz_at_N1')} | {s.get('max_hz_bound_by')} |")
-    e2e = [r for r in rows if r.get('kind') == 'e2e' and r['name'].endswith('_e2e') and 'clips' in (r.get('e2e') or {})]
-    if e2e:
-        L += ['', '## End-to-end driver rows', '',
-              '| row | clips x repeats | encoder ms | first step ms | TTFT ms | decode ms median / p99 max | gpu total median / p99 | RTF | speech tok/s |',
-              '|---|---:|---:|---:|---:|---|---|---:|---:|']
-        for r in e2e:
-            d = r['e2e']
-            L.append(f"| {r['name']} | {d['clips']} x {d['repeats']} | {d.get('encoder_ms_median')} | {d.get('first_step_ms_median')} | "
-                     f"{d['ttft_ms_median']:.1f} | {d.get('decode_ms_median')} / {d['decode_ms_p99_max']:.2f} | "
-                     f"{d['gpu_total_ms_median']:.1f} / {d['gpu_total_ms_p99']:.1f} | {d.get('rtf_wall_median')} | {d.get('speech_tokens_per_s')} |")
-    if a.engine_results:
-        L += ['', f'Per-engine detail (nsys, NCU roofline, clock drift): {os.path.dirname(a.engine_results)}/report.md']
-    open(a.report, 'w').write('\n'.join(L) + '\n')
-    print(f"  {len(rows)} rows -> {a.out}")
+        if solo.get('budget_complete', True):
+            completeness = 'complete'
+        else:
+            completeness = 'incomplete: ' + ','.join(solo.get('budgets_not_measured', []))
+        if row.get('measurement_valid') is False:
+            completeness += ' INVALID(drift)'
+        lines.append(prefix + f"{row.get('latency_ms'):.3f} | {row.get('latency_source', '')} | "
+                     f"{row.get('hz')} | {row.get('deadline_ms')} | {solo.get('U_max')} | {solo.get('C')} | "
+                     f"{solo.get('L')} | **{solo.get('N')}** | {solo.get('cause')} | {completeness} |")
+    return lines
+
+
+def generative_table(rows):
+    generative_rows = [row for row in rows if row.get('kind') == 'generative']
+    if not generative_rows:
+        return []
+    lines = ['', '## Generative rows (TTFT / decode)', '',
+             '| row | runtime | prec | visual ms | prefill ms | reuse ms | decode ms/tok | tok/s | TTFT ms | '
+             'e2e TTFT ms | e2e tok/s | e2e decode p99 | peak mem MB |',
+             '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+    for row in generative_rows:
+        bench = row.get('generative') or {}
+        battery = bench.get('e2e') or {}
+        lines.append(f"| {row['name']} | {row.get('runtime')} | {row.get('precision')} | "
+                     f"{bench.get('visual_ms')} | "
+                     f"{bench.get('prefill_ms') or bench.get('prefill_cold_ms')} | "
+                     f"{bench.get('prefill_reuse_ms')} | {bench.get('decode_ms')} | "
+                     f"{bench.get('tokens_per_s_bench')} | "
+                     f"{bench.get('ttft_ms_bench') or bench.get('ttft_ms')} | "
+                     f"{battery.get('ttft_ms')} | {battery.get('tokens_per_second')} | "
+                     f"{battery.get('decode_ms_p99')} | {row.get('vram_mb')} |")
+    return lines
+
+
+def rate_sweep_table(rows):
+    sweep_rows = [row for row in rows if (row.get('solo') or {}).get('N_vs_hz')]
+    if not sweep_rows:
+        return []
+    grid = list(sweep_rows[0]['solo']['N_vs_hz'].keys())
+    lines = ['', '## Rate sweep - generative and e2e rows (spec rate not fixed: MODEL_HZ is a placeholder)',
+             '',
+             'N at each candidate rate with the period (1000/rate) as the deadline and the same measured '
+             'budgets; **max rate @ N>=1** = the highest solo rate the row sustains, and which budget binds '
+             'there. Rates are Hz for step rows and tokens/s for decode rows. Read the verdict off the '
+             'column once the rate is decided.', '',
+             '| row | latency ms | ' + ' | '.join(f'N@{rate}' for rate in grid)
+             + ' | max rate @ N>=1 | binds at max |',
+             '|---|---:|' + '---:|' * len(grid) + '---:|---|']
+    for row in sweep_rows:
+        solo = row['solo']
+        lines.append(f"| {row['name']} | {row['latency_ms']:.1f} | "
+                     + ' | '.join(str(solo['N_vs_hz'][rate]) for rate in grid)
+                     + f" | {solo.get('max_hz_at_N1')} | {solo.get('max_hz_bound_by')} |")
+    return lines
+
+
+def e2e_driver_table(rows):
+    driver_rows = [row for row in rows
+                   if row.get('kind') == 'e2e' and row['name'].endswith('_e2e')
+                   and 'clips' in (row.get('e2e') or {})]
+    if not driver_rows:
+        return []
+    lines = ['', '## End-to-end driver rows', '',
+             '| row | clips x repeats | encoder ms | first step ms | TTFT ms | decode ms median / p99 max | '
+             'gpu total median / p99 | RTF | speech tok/s |',
+             '|---|---:|---:|---:|---:|---|---|---:|---:|']
+    for row in driver_rows:
+        detail = row['e2e']
+        lines.append(f"| {row['name']} | {detail['clips']} x {detail['repeats']} | "
+                     f"{detail.get('encoder_ms_median')} | {detail.get('first_step_ms_median')} | "
+                     f"{detail['ttft_ms_median']:.1f} | {detail.get('decode_ms_median')} / "
+                     f"{detail['decode_ms_p99_max']:.2f} | "
+                     f"{detail['gpu_total_ms_median']:.1f} / {detail['gpu_total_ms_p99']:.1f} | "
+                     f"{detail.get('rtf_wall_median')} | {detail.get('speech_tokens_per_s')} |")
+    return lines
+
+
+def report_lines(merged, rows, provenance, engine_results_path):
+    lines = ['# Stage 4 - solo per-model measurement', '',
+             f"device: {provenance.get('device')}  platform: {provenance.get('platform')}  "
+             f"tag: {provenance.get('device_tag')}  date: {provenance.get('date')}",
+             f"ceilings: {provenance.get('ceilings_json')}",
+             f"bw_eff {merged.get('bw_eff_gbps')} GB/s ({merged.get('bw_ceiling_source')})  "
+             f"vram cap {merged.get('vram_capacity_mb')} MB ({merged.get('vram_capacity_source')})",
+             '', 'N = min(L, C); C = 1/U_max over time, DRAM-bandwidth and VRAM budgets; '
+             'L = deadline / latency of record.',
+             'cause: latency-limited (L < C, needs faster silicon) vs throughput-limited (C < L, buyable '
+             'with capacity).', '']
+    lines += verdict_table(rows)
+    lines += generative_table(rows)
+    lines += rate_sweep_table(rows)
+    lines += e2e_driver_table(rows)
+    if engine_results_path:
+        lines += ['', f'Per-engine detail (nsys, NCU roofline, clock drift): '
+                      f'{os.path.dirname(engine_results_path)}/report.md']
+    return lines
+
+
+def load_json_or(path, default):
+    if path and os.path.exists(path):
+        return json.load(open(path))
+    return default
+
+
+def cmd_merge(args):
+    budgets = load_json_or(args.budgets, {'rows': []})
+    engine_results = load_json_or(args.engine_results, {})
+    provenance = load_json_or(args.provenance, {})
+    rows = ([engine_row_summary(model) for model in engine_results.get('models', [])]
+            + list(budgets.get('rows', [])))
+    merged = merged_results(budgets, engine_results, provenance, rows, args.engine_results)
+    json.dump(merged, open(args.out, 'w'), indent=1)
+    lines = report_lines(merged, rows, provenance, args.engine_results)
+    open(args.report, 'w').write('\n'.join(lines) + '\n')
+    print(f"  {len(rows)} rows -> {args.out}")
+
+
+def add_measurement_flags(parser, *extra):
+    """--row first, then the subcommand's own inputs, then the shared --vram/--drift/--out."""
+    parser.add_argument('--row', required=True)
+    for flag, kwargs in extra:
+        parser.add_argument(flag, **kwargs)
+    parser.add_argument('--vram', default='')
+    parser.add_argument('--drift', default='')
+    parser.add_argument('--out', required=True)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    sp = ap.add_subparsers(dest='cmd', required=True)
-    p = sp.add_parser('select'); p.add_argument('--rows-dir', required=True); p.add_argument('--only', action='append', default=[])
-    p.add_argument('--kind'); p.add_argument('--shell', action='store_true'); p.add_argument('--table', action='store_true'); p.set_defaults(f=cmd_select)
-    p = sp.add_parser('mix'); p.add_argument('--rows-dir', required=True); p.add_argument('--only', action='append', default=[])
-    p.add_argument('--out', required=True); p.set_defaults(f=cmd_mix)
-    p = sp.add_parser('e2e'); p.add_argument('--row', required=True); p.add_argument('--jsonl', required=True)
-    p.add_argument('--vram', default=''); p.add_argument('--drift', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_e2e)
-    p = sp.add_parser('edgellm'); p.add_argument('--row', required=True); p.add_argument('--bench-dir', required=True)
-    p.add_argument('--profile', default=''); p.add_argument('--vram', default=''); p.add_argument('--drift', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_edgellm)
-    p = sp.add_parser('trtllm'); p.add_argument('--row', required=True); p.add_argument('--sweep', required=True)
-    p.add_argument('--vram', default=''); p.add_argument('--drift', default=''); p.add_argument('--out', required=True); p.set_defaults(f=cmd_trtllm)
-    p = sp.add_parser('merge'); p.add_argument('--budgets', default=''); p.add_argument('--engine-results', default='')
-    p.add_argument('--provenance', default=''); p.add_argument('--out', required=True); p.add_argument('--report', required=True); p.set_defaults(f=cmd_merge)
-    a = ap.parse_args()
-    a.f(a)
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest='cmd', required=True)
+
+    select = subparsers.add_parser('select')
+    select.add_argument('--rows-dir', required=True)
+    select.add_argument('--only', action='append', default=[])
+    select.add_argument('--kind')
+    select.add_argument('--shell', action='store_true')
+    select.add_argument('--table', action='store_true')
+    select.set_defaults(run=cmd_select)
+
+    mix = subparsers.add_parser('mix')
+    mix.add_argument('--rows-dir', required=True)
+    mix.add_argument('--only', action='append', default=[])
+    mix.add_argument('--out', required=True)
+    mix.set_defaults(run=cmd_mix)
+
+    e2e = subparsers.add_parser('e2e')
+    add_measurement_flags(e2e, ('--jsonl', {'required': True}))
+    e2e.set_defaults(run=cmd_e2e)
+
+    edgellm = subparsers.add_parser('edgellm')
+    add_measurement_flags(edgellm, ('--bench-dir', {'required': True}), ('--profile', {'default': ''}))
+    edgellm.set_defaults(run=cmd_edgellm)
+
+    trtllm = subparsers.add_parser('trtllm')
+    add_measurement_flags(trtllm, ('--sweep', {'required': True}))
+    trtllm.set_defaults(run=cmd_trtllm)
+
+    merge = subparsers.add_parser('merge')
+    merge.add_argument('--budgets', default='')
+    merge.add_argument('--engine-results', default='')
+    merge.add_argument('--provenance', default='')
+    merge.add_argument('--out', required=True)
+    merge.add_argument('--report', required=True)
+    merge.set_defaults(run=cmd_merge)
+
+    args = parser.parse_args()
+    args.run(args)
 
 
 if __name__ == '__main__':

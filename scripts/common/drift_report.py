@@ -1,82 +1,11 @@
 #!/usr/bin/env python3
-"""Quantitative clock-drift verdict over an under-load sampler CSV (driftmon/v1).
+"""Clock-drift verdict over an under-load clock_sampler CSV (schema driftmon/v1).
 
-Replaces the old start-vs-end `cmp` of two clock snapshots: two matching
-endpoints say nothing about the minutes in between, so the verdict here is
-computed over every sample the clock_sampler recorded during the measurement.
-
-Usage:
-  drift_report.py <samples.csv> --device <cfg.json> --lock <lock_verified.json> \
-                  --out <drift.json> [--phase <label>]
-
-Input CSV (platform self-detected from the header row):
-  jetson:   t_s,gpu_mhz,emc_mhz,module_w,vdd_gpu_w,tj_c,oc_event_count
-  discrete: t_s,sm_mhz,mem_mhz,power_w,temp_c,throttle_reasons_hex
-Reference clocks come from the lock JSON's reference_clock_mhz{sm,mem}
-(jetson mapping: sm = gpu_mhz column, mem = emc_mhz column) — the REALIZED
-lock, never the requested value.
-
-Verdict thresholds (pre-declared, not post-hoc):
-  discrete, per clock (sm and mem; worst clock wins):
-    PASS  >= 99% of samples within +/-1% of the reference clock
-    WARN  95-99%   (brief excursions; numbers stand, flagged)
-    FAIL  < 95%, or |median - reference|/reference > 2%
-          (the run averaged off-lock: DVFS owned the clock, timings are not
-          lock-conditioned)
-  power-governed reclassification (discrete only, adopted 2026-08-12):
-    a power-capped part cannot hold ANY useful SM clock under an all-out
-    tensor load — at the cap the governor floats V/F to hold POWER while the
-    work rate stays tight (a discrete Blackwell card 3-min soak: clock wandered 1897-2062
-    MHz, yet 0/2247 throughput samples fell below 0.9x best). The device's
-    invariant is its power, as jetson's is its clock, so each is judged by
-    the invariant it can physically hold. When an sm FAIL's only cause is the
-    power governor, the sm clock is demoted to recorded-data and the verdict
-    to WARN. ALL conditions required:
-      - mem clock verdict PASS (the dial axis and bandwidth basis held)
-      - no FAIL-class throttle reason (hw_slowdown / thermal) in any sample
-      - sm median deviation <= 10% of reference (a collapse still FAILs)
-    AMENDED 2026-08-19 (a light int8 model run): the original rule also
-    required sw_power_cap to be OBSERVED in the samples. Light workloads
-    (~176 W on a 300 W part, 1.2 ms kernels) float the sm clock across boost
-    bins 1987-2152 without ever asserting the flag — the governor owns the
-    clock at every load level on this part, not only at the cap (verified
-    twice: a 2160 request floated 2062-2152; a 2062 request floated
-    1987-2055; zero throttle flags both times, mem rock-solid at 13365).
-    The sw_power_cap-observed condition is therefore dropped: on discrete,
-    an off-target sm clock with mem PASS, no hw/thermal reason, and median
-    dev <= 10% is ALWAYS recorded-data (sm_recorded_data:true, measured
-    range kept in the clocks block) and the verdict WARN. The sm clock on
-    this part is telemetry, not an invariant; the invariants judged are the
-    mem clock and the absence of hw/thermal throttling.
-    Corroborating throughput evidence lives outside this tool by design:
-    the ceilings clean-spread policy, sustained-suite clamp incidence, and
-    each model's p99/median spread.
-  jetson, per clock:
-    PASS  >= 99.5% within +/-1% of reference, else FAIL
-          (a locked devfreq cannot legitimately move; anything beyond read
-          jitter means the lock dropped)
-  throttle reasons (discrete, decoded from throttle_reasons_hex):
-    sw_power_cap (0x4)           -> WARN only (expected physics at the power
-                                    limit; matches the ceilings clean-spread
-                                    doctrine)
-    hw_slowdown (0x8)            -> FAIL (DVFS took over; clocks were not what
-    sw_thermal_slowdown (0x20)      the lock promised — the timing numbers are
-    hw_thermal_slowdown (0x40)      not lock-conditioned)
-    sync_boost (0x10)            -> named and recorded, no verdict effect
-    any unknown nonzero bits     -> recorded as present (raw hex always kept),
-                                    no verdict effect — verdict-bearing reasons
-                                    are enumerated above
-  jetson clamp channel (recorded data, NEVER a verdict input):
-    oc_event_count deltas + samples with module power above the config
-    power_envelope_w. Overcurrent clamps are ms-scale and invisible at this
-    sampling rate — the clamp channel carries them, so they cannot cause
-    false clock FAILs; throughput dips they cause are handled by the
-    ceilings' clean-spread policy.
-  zero data rows -> verdict "SKIP" with a labelled reason (no evidence either
-    way; downstream treats it as absent, not passing).
-
-Exit 0 always (the verdict lives in the JSON); exit 1 only when an input file
-is unreadable or its header matches neither contract. stdlib only.
+Usage: drift_report.py <samples.csv> --device <cfg.json> --lock <lock_verified.json> --out <drift.json>
+       [--phase <label>]
+Judges every sample against the REALIZED lock (lock JSON reference_clock_mhz{sm,mem}), never the
+requested value. Prints "drift[ <phase>]: <verdict> ..." then one indented line per cause; the verdict
+lives in the JSON. Exit 0 always, 1 only when an input is unreadable or the CSV header is unknown.
 """
 import argparse
 import csv
@@ -86,14 +15,31 @@ import sys
 import time
 from pathlib import Path
 
-# Pre-declared thresholds (rationale in the module docstring).
+# Pre-declared thresholds (never post-hoc), per clock with the worst clock winning.
+# discrete: PASS >= 99% of samples within +/-1% of reference, WARN 95-99% (brief excursions,
+#   numbers stand but flagged), FAIL below 95% or when the median sits > 2% off reference
+#   (the run averaged off-lock: DVFS owned the clock, the timings are not lock-conditioned).
+# jetson: a locked devfreq cannot legitimately move, so anything beyond read jitter
+#   (< 99.5% at target) means the lock dropped -> FAIL.
 DISCRETE_PASS_PCT = 99.0
 DISCRETE_WARN_PCT = 95.0
 DISCRETE_MEDIAN_DEV_PCT = 2.0
 JETSON_PASS_PCT = 99.5
 AT_TARGET_FRAC = 0.01
+
+# Power-governed reclassification (discrete only). A power-capped part cannot hold ANY useful
+# SM clock under an all-out tensor load: the governor floats V/F to hold POWER while the work
+# rate stays tight, and it owns the SM clock at every load level, not only at the cap (light
+# loads float across boost bins without ever asserting sw_power_cap). The device's invariant
+# is therefore its power, as jetson's is its clock. When an sm FAIL's only cause is that
+# governor, the sm clock is demoted to recorded data and the verdict to WARN, provided the
+# mem clock PASSed, no hw/thermal throttle reason appeared, and the sm median deviation is
+# <= 10% (a collapse still FAILs). Corroborating throughput evidence lives outside this tool.
 POWER_GOVERNED_MAX_MEDIAN_DEV_PCT = 10.0
 
+# Throttle reasons decoded from throttle_reasons_hex. sw_power_cap is expected physics at the
+# power limit (WARN only); hw/thermal slowdowns mean DVFS took over (FAIL); sync_boost and
+# unknown bits are recorded and never affect the verdict (raw hex is always kept).
 THROTTLE_FLAGS = {
     0x4: "sw_power_cap",
     0x8: "hw_slowdown",
@@ -110,6 +56,12 @@ DISCRETE_HEADER = ["t_s", "sm_mhz", "mem_mhz", "power_w", "temp_c", "throttle_re
 
 RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
 
+# Jetson overcurrent clamps are ms-scale and invisible at the sampling rate; the clamp
+# channel carries them as data so they can never cause a false clock FAIL.
+CLAMP_NOTE = ("recorded data, never a verdict input — ms-scale clamps are invisible "
+              "at this sampling rate; this channel carries them so they cannot cause "
+              "false clock FAILs")
+
 
 def say(msg):
     print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
@@ -120,35 +72,40 @@ def die(msg):
     sys.exit(1)
 
 
-def fnum(x):
-    if x is None:
+def parse_float(text):
+    if text is None:
         return None
-    x = x.strip()
-    if not x:
+    text = text.strip()
+    if not text:
         return None
     try:
-        return float(x)
+        return float(text)
     except ValueError:
         return None
 
 
-def num_stats(vals):
-    if not vals:
-        return None
-    return {"min": round(min(vals), 3), "median": round(statistics.median(vals), 3),
-            "mean": round(statistics.fmean(vals), 3), "max": round(max(vals), 3),
-            "n": len(vals)}
+def column_values(rows, column):
+    """Readable numeric values of one CSV column, blanks dropped."""
+    return [value for value in (parse_float(row.get(column)) for row in rows) if value is not None]
 
 
-def clock_block(vals, ref):
-    if not vals:
+def num_stats(values):
+    if not values:
         return None
-    med = statistics.median(vals)
-    at = sum(1 for v in vals if abs(v - ref) <= AT_TARGET_FRAC * ref)
-    return {"min": round(min(vals), 1), "median": round(med, 1), "max": round(max(vals), 1),
-            "n": len(vals), "reference_mhz": ref,
-            "pct_at_target": round(100.0 * at / len(vals), 2),
-            "median_dev_pct": round(abs(med - ref) / ref * 100.0, 3)}
+    return {"min": round(min(values), 3), "median": round(statistics.median(values), 3),
+            "mean": round(statistics.fmean(values), 3), "max": round(max(values), 3),
+            "n": len(values)}
+
+
+def clock_block(values, reference_mhz):
+    if not values:
+        return None
+    median = statistics.median(values)
+    at_target = sum(1 for value in values if abs(value - reference_mhz) <= AT_TARGET_FRAC * reference_mhz)
+    return {"min": round(min(values), 1), "median": round(median, 1), "max": round(max(values), 1),
+            "n": len(values), "reference_mhz": reference_mhz,
+            "pct_at_target": round(100.0 * at_target / len(values), 2),
+            "median_dev_pct": round(abs(median - reference_mhz) / reference_mhz * 100.0, 3)}
 
 
 def clock_verdict_discrete(block):
@@ -165,84 +122,214 @@ def clock_verdict_jetson(block):
     return "PASS" if block["pct_at_target"] >= JETSON_PASS_PCT else "FAIL"
 
 
-def decode_throttle(hex_vals):
+def decode_throttle(hex_values):
     """Per-flag sample counts + raw hex + unknown-bit OR across all samples."""
     counts = {name: 0 for name in THROTTLE_FLAGS.values()}
     raw_seen, unknown_or, throttled = set(), 0, 0
-    for v in hex_vals:
-        raw_seen.add(f"0x{v:x}")
-        if v:
+    for value in hex_values:
+        raw_seen.add(f"0x{value:x}")
+        if value:
             throttled += 1
         for mask, name in THROTTLE_FLAGS.items():
-            if v & mask:
+            if value & mask:
                 counts[name] += 1
-        unknown_or |= v & ~KNOWN_MASK
-    n = len(hex_vals)
+        unknown_or |= value & ~KNOWN_MASK
+    n = len(hex_values)
     reasons = [name for name in counts if counts[name] > 0]
     if unknown_or:
         reasons.append(f"unknown_bits(0x{unknown_or:x})")
-    if any(counts[f] > 0 for f in FAIL_FLAGS):
+    if any(counts[flag] > 0 for flag in FAIL_FLAGS):
         verdict = "FAIL"
-    elif any(counts[f] > 0 for f in WARN_FLAGS):
+    elif any(counts[flag] > 0 for flag in WARN_FLAGS):
         verdict = "WARN"
     else:
         verdict = "PASS"
-    return {
+    block = {
         "samples_decoded": n,
         "pct_samples_throttled": round(100.0 * throttled / n, 2) if n else None,
         "per_reason_sample_counts": counts,
         "raw_hex_seen": sorted(raw_seen),
         "unknown_bits": f"0x{unknown_or:x}" if unknown_or else None,
         "verdict": verdict,
-    }, reasons, verdict
+    }
+    return block, reasons, verdict
+
+
+def throttle_hex_values(rows):
+    values = []
+    for row in rows:
+        raw = (row.get("throttle_reasons_hex") or "").strip()
+        if not raw:
+            continue
+        try:
+            values.append(int(raw, 16))
+        except ValueError:
+            pass
+    return values
+
+
+def clamp_block(rows, power_envelope_w):
+    """Jetson clamp channel: oc_event_count deltas and samples above the config power envelope."""
+    oc_counts = [int(value) for value in column_values(rows, "oc_event_count")]
+    power_values = column_values(rows, "module_w")
+    over_envelope = None
+    if isinstance(power_envelope_w, (int, float)) and power_values:
+        over_envelope = sum(1 for value in power_values if value > power_envelope_w)
+    clamp_events = (oc_counts[-1] - oc_counts[0]) if len(oc_counts) >= 2 else None
+    intervals_increasing = None
+    if len(oc_counts) >= 2:
+        intervals_increasing = sum(1 for before, after in zip(oc_counts, oc_counts[1:]) if after > before)
+    block = {
+        "oc_event_count_first": oc_counts[0] if oc_counts else None,
+        "oc_event_count_last": oc_counts[-1] if oc_counts else None,
+        "oc_event_count_delta": clamp_events,
+        "intervals_with_oc_increase": intervals_increasing,
+        "power_envelope_w": power_envelope_w,
+        "power_over_envelope_samples": over_envelope,
+        "note": CLAMP_NOTE,
+    }
+    return block, clamp_events
+
+
+def load_json(path, what):
+    try:
+        return json.loads(Path(path).resolve().read_text())
+    except (OSError, ValueError) as error:
+        die(f"cannot read {what} {path}: {error}")
+
+
+def read_samples(csv_path):
+    try:
+        with open(csv_path, newline="") as handle:
+            reader = csv.DictReader(handle)
+            return reader.fieldnames or [], list(reader)
+    except OSError as error:
+        die(f"cannot read samples CSV {csv_path}: {error}")
+
+
+def detect_platform(fields):
+    """(platform, sm column, mem column) from the CSV header; dies on an unknown header."""
+    field_set = set(fields)
+    if {"gpu_mhz", "emc_mhz"} <= field_set:
+        return "jetson", "gpu_mhz", "emc_mhz"
+    if {"sm_mhz", "mem_mhz"} <= field_set:
+        return "discrete", "sm_mhz", "mem_mhz"
+    die(f"unrecognized samples header {fields} — expected jetson {JETSON_HEADER} "
+        f"or discrete {DISCRETE_HEADER}")
+
+
+def write_doc(doc, out_arg):
+    out_path = Path(out_arg).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(doc, indent=1) + "\n")
+    return out_path
+
+
+def add_clock_blocks(doc, rows, platform, columns, reference, notes, causes, verdicts):
+    doc["clocks"] = {}
+    for label, column in columns.items():
+        reference_mhz = float(reference[label])
+        block = clock_block(column_values(rows, column), reference_mhz)
+        if block is None:
+            notes.append(f"SKIP: column {column} had no readable values — {label} clock unverified")
+            doc["clocks"][label] = None
+            continue
+        verdict = clock_verdict_jetson(block) if platform == "jetson" else clock_verdict_discrete(block)
+        block["verdict"] = verdict
+        block["source_column"] = column
+        doc["clocks"][label] = block
+        verdicts.append(verdict)
+        if verdict != "PASS":
+            causes.append(f"{label}: {block['pct_at_target']}% of samples within 1% of "
+                          f"{reference_mhz:g} MHz (median {block['median']} MHz, "
+                          f"dev {block['median_dev_pct']}%) -> {verdict}")
+
+
+def add_context_stats(doc, rows, platform):
+    """Power / temperature statistics: context, never verdict-bearing."""
+    if platform == "jetson":
+        doc["power_w"] = num_stats(column_values(rows, "module_w"))
+        doc["vdd_gpu_w"] = num_stats(column_values(rows, "vdd_gpu_w"))
+        doc["temp_c"] = num_stats(column_values(rows, "tj_c"))
+        return
+    doc["power_w"] = num_stats(column_values(rows, "power_w"))
+    doc["temp_c"] = num_stats(column_values(rows, "temp_c"))
+
+
+def add_throttle_channel(doc, rows, notes, causes, verdicts):
+    """Discrete throttle channel; returns the reasons seen."""
+    hex_values = throttle_hex_values(rows)
+    if not hex_values:
+        doc["throttle"] = None
+        notes.append("SKIP: throttle_reasons_hex had no readable values")
+        return []
+    doc["throttle"], reasons, verdict = decode_throttle(hex_values)
+    verdicts.append(verdict)
+    if verdict == "FAIL":
+        active = sorted(set(reasons) & FAIL_FLAGS)
+        causes.append(f"throttle reasons active: {', '.join(active)} — DVFS took over")
+    elif verdict == "WARN":
+        causes.append("sw_power_cap active — expected physics at the power limit, flagged only")
+    return reasons
+
+
+def reclassify_power_governed(doc, throttle_reasons, causes):
+    """Demote a governor-caused sm FAIL to WARN; returns (causes, verdicts) or None when not applicable."""
+    sm_block = doc["clocks"].get("sm")
+    mem_block = doc["clocks"].get("mem")
+    applicable = (sm_block and sm_block.get("verdict") == "FAIL"
+                  and mem_block and mem_block.get("verdict") == "PASS"
+                  and not (set(throttle_reasons) & FAIL_FLAGS)
+                  and sm_block.get("median_dev_pct") is not None
+                  and sm_block["median_dev_pct"] <= POWER_GOVERNED_MAX_MEDIAN_DEV_PCT)
+    if not applicable:
+        return None
+    sm_block["verdict"] = "WARN"
+    sm_block["power_governed"] = True
+    sm_block["sm_recorded_data"] = True
+    causes = [cause.replace("-> FAIL", "-> WARN (power-governed)") if cause.startswith("sm:") else cause
+              for cause in causes]
+    governed_by = ("sw_power_cap observed" if "sw_power_cap" in throttle_reasons
+                   else "no throttle flag asserted (boost-governed at light load)")
+    causes.append(
+        f"power-governed reclassification: sm clock is recorded-data on this part "
+        f"(mem PASS, {governed_by}, median dev {sm_block['median_dev_pct']}% "
+        f"<= {POWER_GOVERNED_MAX_MEDIAN_DEV_PCT:g}%) — measured sm range "
+        f"{sm_block.get('min')}-{sm_block.get('max')} MHz kept in the clocks block")
+    verdicts = [block["verdict"] for block in doc["clocks"].values() if block]
+    if doc.get("throttle"):
+        verdicts.append(doc["throttle"]["verdict"])
+    return causes, verdicts
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="clock-drift verdict over sampler CSV (driftmon/v1)")
+    parser.add_argument("samples_csv", help="clock_sampler output CSV")
+    parser.add_argument("--device", required=True, help="device config JSON")
+    parser.add_argument("--lock", required=True, help="lock_verified.json from verify_lock.py")
+    parser.add_argument("--out", required=True, help="output drift.json path")
+    parser.add_argument("--phase", default=None, help="label for the measurement phase this covers")
+    return parser.parse_args()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="clock-drift verdict over sampler CSV (driftmon/v1)")
-    ap.add_argument("samples_csv", help="clock_sampler output CSV")
-    ap.add_argument("--device", required=True, help="device config JSON")
-    ap.add_argument("--lock", required=True, help="lock_verified.json from verify_lock.py")
-    ap.add_argument("--out", required=True, help="output drift.json path")
-    ap.add_argument("--phase", default=None, help="label for the measurement phase this covers")
-    args = ap.parse_args()
-
+    args = parse_args()
     csv_path = Path(args.samples_csv).resolve()
-    try:
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            fields = reader.fieldnames or []
-            rows = list(reader)
-    except OSError as e:
-        die(f"cannot read samples CSV {csv_path}: {e}")
+    fields, rows = read_samples(csv_path)
+    config = load_json(args.device, "device config")
+    lock = load_json(args.lock, "lock JSON")
 
-    try:
-        cfg = json.loads(Path(args.device).resolve().read_text())
-    except (OSError, ValueError) as e:
-        die(f"cannot read device config {args.device}: {e}")
-    try:
-        lock = json.loads(Path(args.lock).resolve().read_text())
-    except (OSError, ValueError) as e:
-        die(f"cannot read lock JSON {args.lock}: {e}")
+    reference = lock.get("reference_clock_mhz") or {}
+    if not all(isinstance(reference.get(key), (int, float)) for key in ("sm", "mem")):
+        die(f"lock JSON {args.lock} lacks numeric reference_clock_mhz{{sm,mem}} "
+            "— not a lockverify/v1 file?")
 
-    ref = lock.get("reference_clock_mhz") or {}
-    if not isinstance(ref.get("sm"), (int, float)) or not isinstance(ref.get("mem"), (int, float)):
-        die(f"lock JSON {args.lock} lacks numeric reference_clock_mhz{{sm,mem}} — not a lockverify/v1 file?")
-
-    fset = set(fields)
-    if {"gpu_mhz", "emc_mhz"} <= fset:
-        platform = "jetson"
-        sm_col, mem_col = "gpu_mhz", "emc_mhz"
-    elif {"sm_mhz", "mem_mhz"} <= fset:
-        platform = "discrete"
-        sm_col, mem_col = "sm_mhz", "mem_mhz"
-    else:
-        die(f"unrecognized samples header {fields} — expected jetson {JETSON_HEADER} "
-            f"or discrete {DISCRETE_HEADER}")
+    platform, sm_column, mem_column = detect_platform(fields)
 
     notes = []
-    if cfg.get("platform") not in (None, platform):
+    if config.get("platform") not in (None, platform):
         note = (f"CSV header is {platform}-form but device config says "
-                f"'{cfg.get('platform')}' — trusting the CSV columns")
+                f"'{config.get('platform')}' — trusting the CSV columns")
         notes.append(note)
         print(f"WARN: {note}")
 
@@ -250,11 +337,11 @@ def main():
         "schema": "driftmon/v1",
         "phase": args.phase,
         "platform": platform,
-        "device_tag": cfg.get("device_tag"),
+        "device_tag": config.get("device_tag"),
         "samples_csv": str(csv_path),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "n_samples": len(rows),
-        "reference_clock_mhz": {"sm": ref["sm"], "mem": ref["mem"]},
+        "reference_clock_mhz": {"sm": reference["sm"], "mem": reference["mem"]},
         "notes": notes,
     }
 
@@ -264,148 +351,51 @@ def main():
         doc["pct_at_target"] = None
         doc["throttle_reasons_seen"] = []
         doc["clamp_events"] = None
-        out = Path(args.out).resolve()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(doc, indent=1) + "\n")
-        say(f"verdict: SKIP (empty CSV) — written to {out}")
+        out_path = write_doc(doc, args.out)
+        say(f"verdict: SKIP (empty CSV) — written to {out_path}")
         sys.exit(0)
 
-    t_vals = [v for v in (fnum(r.get("t_s")) for r in rows) if v is not None]
-    doc["duration_s"] = round(t_vals[-1] - t_vals[0], 3) if len(t_vals) >= 2 else None
+    times = column_values(rows, "t_s")
+    doc["duration_s"] = round(times[-1] - times[0], 3) if len(times) >= 2 else None
 
-    # --- per-clock statistics vs the REALIZED reference -----------------------
     causes, verdicts = [], []
-    doc["clocks"] = {}
-    for label, col, ref_mhz in (("sm", sm_col, float(ref["sm"])), ("mem", mem_col, float(ref["mem"]))):
-        vals = [v for v in (fnum(r.get(col)) for r in rows) if v is not None]
-        block = clock_block(vals, ref_mhz)
-        if block is None:
-            notes.append(f"SKIP: column {col} had no readable values — {label} clock unverified")
-            doc["clocks"][label] = None
-            continue
-        v = clock_verdict_jetson(block) if platform == "jetson" else clock_verdict_discrete(block)
-        block["verdict"] = v
-        block["source_column"] = col
-        doc["clocks"][label] = block
-        verdicts.append(v)
-        if v != "PASS":
-            causes.append(f"{label}: {block['pct_at_target']}% of samples within 1% of "
-                          f"{ref_mhz:g} MHz (median {block['median']} MHz, "
-                          f"dev {block['median_dev_pct']}%) -> {v}")
+    add_clock_blocks(doc, rows, platform, {"sm": sm_column, "mem": mem_column},
+                     reference, notes, causes, verdicts)
+    add_context_stats(doc, rows, platform)
 
-    # --- power / temperature (context, not verdict-bearing) -------------------
-    if platform == "jetson":
-        doc["power_w"] = num_stats([v for v in (fnum(r.get("module_w")) for r in rows) if v is not None])
-        doc["vdd_gpu_w"] = num_stats([v for v in (fnum(r.get("vdd_gpu_w")) for r in rows) if v is not None])
-        doc["temp_c"] = num_stats([v for v in (fnum(r.get("tj_c")) for r in rows) if v is not None])
-    else:
-        doc["power_w"] = num_stats([v for v in (fnum(r.get("power_w")) for r in rows) if v is not None])
-        doc["temp_c"] = num_stats([v for v in (fnum(r.get("temp_c")) for r in rows) if v is not None])
-
-    # --- throttle (discrete) / clamp (jetson) channels ------------------------
     throttle_reasons = []
     if platform == "discrete":
-        hex_vals = []
-        for r in rows:
-            raw = (r.get("throttle_reasons_hex") or "").strip()
-            if not raw:
-                continue
-            try:
-                hex_vals.append(int(raw, 16))
-            except ValueError:
-                pass
-        if hex_vals:
-            doc["throttle"], throttle_reasons, tv = decode_throttle(hex_vals)
-            verdicts.append(tv)
-            if tv == "FAIL":
-                bad = sorted(set(throttle_reasons) & FAIL_FLAGS)
-                causes.append(f"throttle reasons active: {', '.join(bad)} — DVFS took over")
-            elif tv == "WARN":
-                causes.append("sw_power_cap active — expected physics at the power limit, flagged only")
-        else:
-            doc["throttle"] = None
-            notes.append("SKIP: throttle_reasons_hex had no readable values")
+        throttle_reasons = add_throttle_channel(doc, rows, notes, causes, verdicts)
         doc["clamp"] = None
         clamp_events = None
+        reclassified = reclassify_power_governed(doc, throttle_reasons, causes)
+        if reclassified is not None:
+            causes, verdicts = reclassified
     else:
         doc["throttle"] = None
-        oc = []
-        for r in rows:
-            v = fnum(r.get("oc_event_count"))
-            if v is not None:
-                oc.append(int(v))
-        power_vals = [v for v in (fnum(r.get("module_w")) for r in rows) if v is not None]
-        envelope = cfg.get("power_envelope_w")
-        over = (sum(1 for v in power_vals if v > envelope)
-                if isinstance(envelope, (int, float)) and power_vals else None)
-        clamp_events = (oc[-1] - oc[0]) if len(oc) >= 2 else None
-        doc["clamp"] = {
-            "oc_event_count_first": oc[0] if oc else None,
-            "oc_event_count_last": oc[-1] if oc else None,
-            "oc_event_count_delta": clamp_events,
-            "intervals_with_oc_increase": (sum(1 for a, b in zip(oc, oc[1:]) if b > a)
-                                           if len(oc) >= 2 else None),
-            "power_envelope_w": envelope,
-            "power_over_envelope_samples": over,
-            "note": ("recorded data, never a verdict input — ms-scale clamps are invisible "
-                     "at this sampling rate; this channel carries them so they cannot cause "
-                     "false clock FAILs"),
-        }
+        doc["clamp"], clamp_events = clamp_block(rows, config.get("power_envelope_w"))
         if clamp_events:
             say(f"clamp channel: {clamp_events} oc events during the window (data, not a failure)")
 
-    # --- power-governed reclassification (discrete only; rule + rationale in
-    # the module docstring, thresholds pre-declared above) ----------------------
-    if platform == "discrete":
-        sm_blk = doc["clocks"].get("sm")
-        mem_blk = doc["clocks"].get("mem")
-        # 2026-08-19 amendment (docstring): sw_power_cap-observed is no longer
-        # required — the governor owns the sm clock at every load level on
-        # this part; light loads float it without asserting the flag.
-        if (sm_blk and sm_blk.get("verdict") == "FAIL"
-                and mem_blk and mem_blk.get("verdict") == "PASS"
-                and not (set(throttle_reasons) & FAIL_FLAGS)
-                and sm_blk.get("median_dev_pct") is not None
-                and sm_blk["median_dev_pct"] <= POWER_GOVERNED_MAX_MEDIAN_DEV_PCT):
-            sm_blk["verdict"] = "WARN"
-            sm_blk["power_governed"] = True
-            sm_blk["sm_recorded_data"] = True
-            causes = [c.replace("-> FAIL", "-> WARN (power-governed)")
-                      if c.startswith("sm:") else c for c in causes]
-            governed_by = ("sw_power_cap observed" if "sw_power_cap" in throttle_reasons
-                           else "no throttle flag asserted (boost-governed at light load)")
-            causes.append(
-                f"power-governed reclassification: sm clock is recorded-data on this part "
-                f"(mem PASS, {governed_by}, median dev {sm_blk['median_dev_pct']}% "
-                f"<= {POWER_GOVERNED_MAX_MEDIAN_DEV_PCT:g}%) — measured sm range "
-                f"{sm_blk.get('min')}-{sm_blk.get('max')} MHz kept in the clocks block")
-            verdicts = [b["verdict"] for b in doc["clocks"].values() if b]
-            if doc.get("throttle"):
-                verdicts.append(doc["throttle"]["verdict"])
-
-    # --- combined verdict (worst of clock verdicts + throttle verdict) --------
     if verdicts:
-        verdict = max(verdicts, key=lambda v: RANK[v])
+        verdict = max(verdicts, key=lambda name: RANK[name])
     else:
         verdict = "SKIP"
         causes.append("SKIP: no clock column had readable values — drift unverifiable")
 
-    at_targets = [b["pct_at_target"] for b in doc["clocks"].values() if b]
+    at_targets = [block["pct_at_target"] for block in doc["clocks"].values() if block]
     doc["pct_at_target"] = min(at_targets) if at_targets else None
     doc["throttle_reasons_seen"] = throttle_reasons
     doc["clamp_events"] = clamp_events
     doc["verdict"] = verdict
     doc["verdict_causes"] = causes
 
-    out = Path(args.out).resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(doc, indent=1) + "\n")
-
+    out_path = write_doc(doc, args.out)
     phase = f" [{args.phase}]" if args.phase else ""
     say(f"drift{phase}: {verdict} — worst pct_at_target "
-        f"{doc['pct_at_target']}% over {doc['n_samples']} samples — {out}")
-    for c in causes:
-        say(f"  {c}")
+        f"{doc['pct_at_target']}% over {doc['n_samples']} samples — {out_path}")
+    for cause in causes:
+        say(f"  {cause}")
     sys.exit(0)
 
 

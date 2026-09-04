@@ -1,94 +1,340 @@
 // Encoder-decoder ASR model end-to-end in C++ (TensorRT runtime API): encoder -> first decoder step -> greedy
 // decoder-with-past loop. CUDA-event timing per stage; token ids written for the (offline) WER step.
-// Build: g++ -O2 -std=c++17 asr_e2e.cpp -I/usr/include/$(gcc -dumpmachine) -I/usr/local/cuda/include \
+// Build: g++ -O2 -std=c++17 asr_e2e.cpp -I/usr/include/$(gcc -dumpmachine) -I/usr/local/cuda/include
 //        -L/usr/local/cuda/lib64 -lnvinfer -lcudart -o asr_e2e
 // Usage: ./asr_e2e <engines_dir> <prec: fp16|fp32_ref> <mel list.txt> <out.jsonl> [repeats=3] [realtime=0]
+// Stdout: one "clip <id> <sec>s enc .. first .. dec med .. p99 .. tok .. wall .. ms RTF .." line per
+// measured clip (the side-load harness waits for the first one), then "DONE".
 #include <NvInfer.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <fstream>
-#include <sstream>
-#include <iostream>
-#include <vector>
-#include <map>
-#include <string>
-#include <chrono>
-#include <thread>
+
 #include <algorithm>
-#include <numeric>
+#include <chrono>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
 using namespace nvinfer1;
-struct Logger : public ILogger { void log(Severity s, const char* m) noexcept override { if (s <= Severity::kERROR) std::cerr << m << "\n"; } } gLogger;
-static size_t dsize(DataType t){ switch(t){ case DataType::kFLOAT: return 4; case DataType::kHALF: return 2; case DataType::kINT32: return 4; case DataType::kINT64: return 8; case DataType::kINT8: return 1; case DataType::kBOOL: return 1; default: return 4; } }
-static size_t vol(const Dims& d){ size_t v=1; for(int i=0;i<d.nbDims;i++) v*= (size_t)std::max(1, (int)d.d[i]); return v; }
-#define CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ std::cerr<<"CUDA "<<cudaGetErrorString(e)<<" @"<<__LINE__<<"\n"; exit(1);} }while(0)
-struct Eng {
-  ICudaEngine* eng=nullptr; IExecutionContext* ctx=nullptr; std::vector<std::string> in, out; std::map<std::string, DataType> dt;
-  void load(IRuntime* rt, const std::string& path){
-    std::ifstream f(path, std::ios::binary); std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
-    eng = rt->deserializeCudaEngine(b.data(), b.size()); if(!eng){ std::cerr<<"deserialize failed "<<path<<"\n"; exit(1);} ctx = eng->createExecutionContext();
-    for(int i=0;i<eng->getNbIOTensors();i++){ const char* n=eng->getIOTensorName(i); dt[n]=eng->getTensorDataType(n); (eng->getTensorIOMode(n)==TensorIOMode::kINPUT? in: out).push_back(n); }
+using SteadyClock = std::chrono::steady_clock;
+
+struct Logger : public ILogger {
+  void log(Severity severity, const char* message) noexcept override {
+    if (severity <= Severity::kERROR) std::cerr << message << "\n";
+  }
+} g_logger;
+
+#define CK(x)                                                                             \
+  do {                                                                                    \
+    cudaError_t cuda_status = (x);                                                        \
+    if (cuda_status != cudaSuccess) {                                                     \
+      std::cerr << "CUDA " << cudaGetErrorString(cuda_status) << " @" << __LINE__ << "\n"; \
+      exit(1);                                                                            \
+    }                                                                                     \
+  } while (0)
+
+// Model geometry of the exported engines: 32 decoder layers, 20 heads of 64, 1500 encoder frames
+// from a 128 x 3000 mel, 51866-token vocabulary, 448-token context.
+static const int LAYERS = 32;
+static const int HEADS = 20;
+static const int HEAD_DIM = 64;
+static const int ENCODER_FRAMES = 1500;
+static const int HIDDEN = 1280;
+static const int MEL_BINS = 128;
+static const int MEL_FRAMES = 3000;
+static const int VOCAB = 51866;
+static const int MAX_LEN = 448;
+static const int EOS = 50257;
+static const int MAX_PROMPT_TOKENS = 8;
+static const std::vector<int64_t> PROMPT = {50258, 50259, 50360, 50364};
+
+struct Clip {
+  int id;
+  double seconds;
+  std::string mel_path;
+};
+
+struct ClipTiming {
+  SteadyClock::time_point t_start;
+  float encoder_ms = 0;
+  float first_step_ms = 0;
+  std::vector<float> decode_ms;
+  std::vector<int> tokens;
+  double wall_ms = 0;
+};
+
+static size_t element_size(DataType type) {
+  switch (type) {
+    case DataType::kFLOAT:
+      return 4;
+    case DataType::kHALF:
+      return 2;
+    case DataType::kINT32:
+      return 4;
+    case DataType::kINT64:
+      return 8;
+    case DataType::kINT8:
+      return 1;
+    case DataType::kBOOL:
+      return 1;
+    default:
+      return 4;
+  }
+}
+
+static void* device_alloc(size_t bytes) {
+  void* pointer;
+  CK(cudaMalloc(&pointer, bytes));
+  return pointer;
+}
+
+static std::string kv_name(const char* prefix, int layer, const char* side, const std::string& kind) {
+  return std::string(prefix) + "." + std::to_string(layer) + "." + side + "." + kind;
+}
+
+struct Engine {
+  ICudaEngine* engine = nullptr;
+  IExecutionContext* context = nullptr;
+  std::vector<std::string> inputs, outputs;
+  std::map<std::string, DataType> dtype;
+
+  void load(IRuntime* runtime, const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    std::vector<char> blob((std::istreambuf_iterator<char>(file)), {});
+    engine = runtime->deserializeCudaEngine(blob.data(), blob.size());
+    if (!engine) {
+      std::cerr << "deserialize failed " << path << "\n";
+      exit(1);
+    }
+    context = engine->createExecutionContext();
+    for (int i = 0; i < engine->getNbIOTensors(); i++) {
+      const char* name = engine->getIOTensorName(i);
+      dtype[name] = engine->getTensorDataType(name);
+      (engine->getTensorIOMode(name) == TensorIOMode::kINPUT ? inputs : outputs).push_back(name);
+    }
   }
 };
-static void* dalloc(size_t bytes){ void* p; CK(cudaMalloc(&p, bytes)); return p; }
-int main(int argc, char** argv){
-  if(argc<5){ std::cerr<<"usage: engines_dir prec mel_list out.jsonl [repeats] [realtime]\n"; return 1; }
-  std::string ED=argv[1], P=argv[2], LIST=argv[3], OUT=argv[4]; int REP = argc>5? atoi(argv[5]):3; int RT = argc>6? atoi(argv[6]):0;
-  const int L=32, H=20, DH=64, T=1500, VOCAB=51866, MAXLEN=448, EOS=50257; const std::vector<int64_t> PROMPT={50258,50259,50360,50364};
-  IRuntime* rt = createInferRuntime(gLogger); Eng enc, dec1, decp;
-  enc.load(rt, ED+"/encoder_"+P+".engine"); dec1.load(rt, ED+"/decoder_first_"+P+".engine"); decp.load(rt, ED+"/decoder_past_"+P+".engine");
-  cudaStream_t st; CK(cudaStreamCreate(&st));
-  // buffers (max sizes)
-  void* mel = dalloc(128*3000*dsize(enc.dt["input_features"])); void* hid = dalloc((size_t)T*1280*dsize(enc.dt["last_hidden_state"]));
-  void* ids = dalloc(8*8); void* logits1 = dalloc((size_t)8*VOCAB*dsize(dec1.dt["logits"])); void* logitsp = dalloc((size_t)VOCAB*dsize(decp.dt["logits"]));
-  std::map<std::string, void*> encKV; std::map<std::string, void*> decA, decB;   // cross KV (fixed) ; self KV ping-pong
-  for(int i=0;i<L;i++) for(std::string kv: {"key","value"}){
-    encKV["present."+std::to_string(i)+".encoder."+kv] = dalloc((size_t)H*T*DH*4);
-    decA["present."+std::to_string(i)+".decoder."+kv] = dalloc((size_t)H*MAXLEN*DH*4); decB["present."+std::to_string(i)+".decoder."+kv] = dalloc((size_t)H*MAXLEN*DH*4); }
-  std::vector<float> hlog(VOCAB); std::vector<float> hlog1((size_t)8*VOCAB); float* pin; CK(cudaMallocHost((void**)&pin, (size_t)8*VOCAB*4));
-  // read mel list
-  std::ifstream lf(LIST); std::ofstream of(OUT); std::string line; int nclips=0;
-  std::vector<std::tuple<int,double,std::string>> clips; while(std::getline(lf,line)){ std::istringstream ss(line); int id; double sec; std::string p; ss>>id>>sec>>p; clips.push_back({id,sec,p}); }
-  cudaEvent_t e0,e1,e2,ea,eb; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaEventCreate(&e2)); CK(cudaEventCreate(&ea)); CK(cudaEventCreate(&eb));
-  auto run_clip=[&](const std::string& melpath, double sec, int id, bool print){
-    std::vector<float> hm(128*3000); { std::ifstream mf(melpath, std::ios::binary); mf.read((char*)hm.data(), hm.size()*4); }
-    if(enc.dt["input_features"]==DataType::kHALF){ std::vector<__half> hh(hm.size()); for(size_t i=0;i<hm.size();i++) hh[i]=__float2half(hm[i]); CK(cudaMemcpyAsync(mel, hh.data(), hh.size()*2, cudaMemcpyHostToDevice, st)); }
-    else CK(cudaMemcpyAsync(mel, hm.data(), hm.size()*4, cudaMemcpyHostToDevice, st));
-    auto w0=std::chrono::steady_clock::now();
-    // encoder
-    enc.ctx->setInputShape("input_features", Dims3(1,128,3000)); enc.ctx->setTensorAddress("input_features", mel); enc.ctx->setTensorAddress("last_hidden_state", hid);
-    CK(cudaEventRecord(e0, st)); enc.ctx->enqueueV3(st); CK(cudaEventRecord(e1, st));
-    // first step
-    CK(cudaMemcpyAsync(ids, PROMPT.data(), PROMPT.size()*8, cudaMemcpyHostToDevice, st));
-    dec1.ctx->setInputShape("input_ids", Dims2(1,(int)PROMPT.size())); dec1.ctx->setInputShape("encoder_hidden_states", Dims3(1,T,1280));
-    dec1.ctx->setTensorAddress("input_ids", ids); dec1.ctx->setTensorAddress("encoder_hidden_states", hid); dec1.ctx->setTensorAddress("logits", logits1);
-    for(auto& n: dec1.out){ if(n=="logits") continue; if(n.find(".encoder.")!=std::string::npos) dec1.ctx->setTensorAddress(n.c_str(), encKV[n]); else dec1.ctx->setTensorAddress(n.c_str(), decA[n]); }
-    dec1.ctx->enqueueV3(st); CK(cudaEventRecord(e2, st));
-    CK(cudaMemcpyAsync(pin, (char*)logits1 + (size_t)(PROMPT.size()-1)*VOCAB*4, VOCAB*4, cudaMemcpyDeviceToHost, st)); CK(cudaStreamSynchronize(st));
-    float tenc, tfirst; CK(cudaEventElapsedTime(&tenc, e0, e1)); CK(cudaEventElapsedTime(&tfirst, e1, e2));
-    int nxt = (int)(std::max_element(pin, pin+VOCAB)-pin); std::vector<int> outtok{nxt}; std::vector<float> dec_ms; int past=(int)PROMPT.size();
-    std::map<std::string,void*>* cur=&decA; std::map<std::string,void*>* nxtb=&decB;
-    while(nxt!=EOS && past<MAXLEN-1){
-      int64_t t=nxt; CK(cudaMemcpyAsync(ids, &t, 8, cudaMemcpyHostToDevice, st));
-      decp.ctx->setInputShape("input_ids", Dims2(1,1)); decp.ctx->setTensorAddress("input_ids", ids); decp.ctx->setTensorAddress("logits", logitsp);
-      for(int i=0;i<L;i++) for(std::string kv: {"key","value"}){
-        std::string pk="past_key_values."+std::to_string(i)+".decoder."+kv, ek="past_key_values."+std::to_string(i)+".encoder."+kv, pr="present."+std::to_string(i)+".decoder."+kv;
-        decp.ctx->setInputShape(pk.c_str(), Dims4(1,H,past,DH)); decp.ctx->setTensorAddress(pk.c_str(), (*cur)[pr]);
-        decp.ctx->setInputShape(ek.c_str(), Dims4(1,H,T,DH)); decp.ctx->setTensorAddress(ek.c_str(), encKV["present."+std::to_string(i)+".encoder."+kv]);
-        decp.ctx->setTensorAddress(pr.c_str(), (*nxtb)[pr]); }
-      CK(cudaEventRecord(ea, st)); decp.ctx->enqueueV3(st); CK(cudaEventRecord(eb, st));
-      CK(cudaMemcpyAsync(pin, logitsp, VOCAB*4, cudaMemcpyDeviceToHost, st)); CK(cudaStreamSynchronize(st));
-      float td; CK(cudaEventElapsedTime(&td, ea, eb)); dec_ms.push_back(td);
-      nxt=(int)(std::max_element(pin, pin+VOCAB)-pin); outtok.push_back(nxt); past++; std::swap(cur, nxtb);
+
+class AsrPipeline {
+ public:
+  AsrPipeline(const std::string& engines_dir, const std::string& precision, bool realtime)
+      : realtime_(realtime) {
+    IRuntime* runtime = createInferRuntime(g_logger);
+    encoder_.load(runtime, engines_dir + "/encoder_" + precision + ".engine");
+    decoder_first_.load(runtime, engines_dir + "/decoder_first_" + precision + ".engine");
+    decoder_past_.load(runtime, engines_dir + "/decoder_past_" + precision + ".engine");
+    CK(cudaStreamCreate(&stream_));
+    allocate_buffers();
+    for (cudaEvent_t* event : {&encoder_begin_, &encoder_end_, &first_step_end_, &step_begin_, &step_end_}) {
+      CK(cudaEventCreate(event));
     }
-    double wall=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-w0).count();
-    std::vector<float> s=dec_ms; std::sort(s.begin(), s.end()); float med = s.empty()?0:s[s.size()/2]; float p99 = s.empty()?0:s[std::min(s.size()-1,(size_t)(0.99*s.size()))];
-    if(print){ long long w0ns=std::chrono::duration_cast<std::chrono::nanoseconds>(w0.time_since_epoch()).count(); of<<"{\"clip\":"<<id<<",\"t_start_ns\":"<<w0ns<<",\"seconds\":"<<sec<<",\"encoder_ms\":"<<tenc<<",\"first_step_ms\":"<<tfirst<<",\"ttft_ms\":"<<tenc+tfirst<<",\"decode_ms_median\":"<<med<<",\"decode_ms_p99\":"<<p99<<",\"decode_ms_max\":"<<(s.empty()?0:s.back())<<",\"n_tokens\":"<<outtok.size()<<",\"gpu_total_ms\":"<<tenc+tfirst+std::accumulate(dec_ms.begin(),dec_ms.end(),0.0f)<<",\"wall_ms\":"<<wall<<",\"rtf_wall\":"<<wall/1000.0/sec<<",\"tokens\":[";
-      for(size_t i=0;i<outtok.size();i++) of<<(i?",":"")<<outtok[i]; of<<"]}\n"; of.flush();
-      std::cout<<"clip "<<id<<" "<<sec<<"s enc "<<tenc<<" first "<<tfirst<<" dec med "<<med<<" p99 "<<p99<<" tok "<<outtok.size()<<" wall "<<wall<<" ms RTF "<<wall/1000.0/sec<<"\n"; }
-    if(RT){ double sleep_ms = sec*1000.0 - wall; if(sleep_ms>0) std::this_thread::sleep_for(std::chrono::milliseconds((long)sleep_ms)); }
-  };
-  auto [id0,sec0,p0]=clips[0]; run_clip(p0,sec0,id0,false); run_clip(p0,sec0,id0,false);   // warm-up
-  for(int r=0;r<REP;r++) for(auto& [id,sec,p]: clips) run_clip(p,sec,id,true);
-  std::cout<<"DONE\n"; return 0;
+  }
+
+  void run_clip(const Clip& clip, std::ofstream& out, bool print) {
+    ClipTiming timing;
+    upload_mel(clip.mel_path);
+    timing.t_start = SteadyClock::now();
+    int next_token = run_encoder_and_first_step(timing);
+    greedy_decode(next_token, timing);
+    timing.wall_ms = std::chrono::duration<double, std::milli>(SteadyClock::now() - timing.t_start).count();
+    if (print) report(clip, timing, out);
+    if (realtime_) pace_to_realtime(clip.seconds, timing.wall_ms);
+  }
+
+ private:
+  using KvBuffers = std::map<std::string, void*>;
+
+  void allocate_buffers() {
+    mel_ = device_alloc(MEL_BINS * MEL_FRAMES * element_size(encoder_.dtype["input_features"]));
+    hidden_ =
+        device_alloc((size_t)ENCODER_FRAMES * HIDDEN * element_size(encoder_.dtype["last_hidden_state"]));
+    ids_ = device_alloc(MAX_PROMPT_TOKENS * 8);
+    logits_first_ =
+        device_alloc((size_t)MAX_PROMPT_TOKENS * VOCAB * element_size(decoder_first_.dtype["logits"]));
+    logits_past_ = device_alloc((size_t)VOCAB * element_size(decoder_past_.dtype["logits"]));
+    for (int layer = 0; layer < LAYERS; layer++) {
+      for (std::string kind : {"key", "value"}) {
+        encoder_kv_[kv_name("present", layer, "encoder", kind)] =
+            device_alloc((size_t)HEADS * ENCODER_FRAMES * HEAD_DIM * 4);
+        std::string self_name = kv_name("present", layer, "decoder", kind);
+        self_kv_a_[self_name] = device_alloc((size_t)HEADS * MAX_LEN * HEAD_DIM * 4);
+        self_kv_b_[self_name] = device_alloc((size_t)HEADS * MAX_LEN * HEAD_DIM * 4);
+      }
+    }
+    CK(cudaMallocHost((void**)&logits_host_, (size_t)MAX_PROMPT_TOKENS * VOCAB * 4));
+  }
+
+  void upload_mel(const std::string& mel_path) {
+    std::vector<float> mel(MEL_BINS * MEL_FRAMES);
+    {
+      std::ifstream file(mel_path, std::ios::binary);
+      file.read((char*)mel.data(), mel.size() * 4);
+    }
+    if (encoder_.dtype["input_features"] == DataType::kHALF) {
+      std::vector<__half> mel_half(mel.size());
+      for (size_t i = 0; i < mel.size(); i++) mel_half[i] = __float2half(mel[i]);
+      CK(cudaMemcpyAsync(mel_, mel_half.data(), mel_half.size() * 2, cudaMemcpyHostToDevice, stream_));
+    } else {
+      CK(cudaMemcpyAsync(mel_, mel.data(), mel.size() * 4, cudaMemcpyHostToDevice, stream_));
+    }
+  }
+
+  int argmax_host() const {
+    return (int)(std::max_element(logits_host_, logits_host_ + VOCAB) - logits_host_);
+  }
+
+  int run_encoder_and_first_step(ClipTiming& timing) {
+    IExecutionContext* encoder = encoder_.context;
+    encoder->setInputShape("input_features", Dims3(1, MEL_BINS, MEL_FRAMES));
+    encoder->setTensorAddress("input_features", mel_);
+    encoder->setTensorAddress("last_hidden_state", hidden_);
+    CK(cudaEventRecord(encoder_begin_, stream_));
+    encoder->enqueueV3(stream_);
+    CK(cudaEventRecord(encoder_end_, stream_));
+
+    IExecutionContext* first = decoder_first_.context;
+    CK(cudaMemcpyAsync(ids_, PROMPT.data(), PROMPT.size() * 8, cudaMemcpyHostToDevice, stream_));
+    first->setInputShape("input_ids", Dims2(1, (int)PROMPT.size()));
+    first->setInputShape("encoder_hidden_states", Dims3(1, ENCODER_FRAMES, HIDDEN));
+    first->setTensorAddress("input_ids", ids_);
+    first->setTensorAddress("encoder_hidden_states", hidden_);
+    first->setTensorAddress("logits", logits_first_);
+    for (const auto& name : decoder_first_.outputs) {
+      if (name == "logits") continue;
+      bool is_cross = name.find(".encoder.") != std::string::npos;
+      first->setTensorAddress(name.c_str(), is_cross ? encoder_kv_[name] : self_kv_a_[name]);
+    }
+    first->enqueueV3(stream_);
+    CK(cudaEventRecord(first_step_end_, stream_));
+    const char* last_prompt_logits = (char*)logits_first_ + (size_t)(PROMPT.size() - 1) * VOCAB * 4;
+    CK(cudaMemcpyAsync(logits_host_, last_prompt_logits, VOCAB * 4, cudaMemcpyDeviceToHost, stream_));
+    CK(cudaStreamSynchronize(stream_));
+    CK(cudaEventElapsedTime(&timing.encoder_ms, encoder_begin_, encoder_end_));
+    CK(cudaEventElapsedTime(&timing.first_step_ms, encoder_end_, first_step_end_));
+    return argmax_host();
+  }
+
+  // Self-attention KV ping-pongs between two buffer sets: the step reads "current" and writes "next".
+  void bind_decode_step(int past_tokens, KvBuffers& current, KvBuffers& next) {
+    IExecutionContext* step = decoder_past_.context;
+    step->setInputShape("input_ids", Dims2(1, 1));
+    step->setTensorAddress("input_ids", ids_);
+    step->setTensorAddress("logits", logits_past_);
+    for (int layer = 0; layer < LAYERS; layer++) {
+      for (std::string kind : {"key", "value"}) {
+        std::string past_self = kv_name("past_key_values", layer, "decoder", kind);
+        std::string past_cross = kv_name("past_key_values", layer, "encoder", kind);
+        std::string present_self = kv_name("present", layer, "decoder", kind);
+        step->setInputShape(past_self.c_str(), Dims4(1, HEADS, past_tokens, HEAD_DIM));
+        step->setTensorAddress(past_self.c_str(), current[present_self]);
+        step->setInputShape(past_cross.c_str(), Dims4(1, HEADS, ENCODER_FRAMES, HEAD_DIM));
+        step->setTensorAddress(past_cross.c_str(), encoder_kv_[kv_name("present", layer, "encoder", kind)]);
+        step->setTensorAddress(present_self.c_str(), next[present_self]);
+      }
+    }
+  }
+
+  void greedy_decode(int next_token, ClipTiming& timing) {
+    timing.tokens.push_back(next_token);
+    int past_tokens = (int)PROMPT.size();
+    KvBuffers* current = &self_kv_a_;
+    KvBuffers* next = &self_kv_b_;
+    while (next_token != EOS && past_tokens < MAX_LEN - 1) {
+      int64_t token = next_token;
+      CK(cudaMemcpyAsync(ids_, &token, 8, cudaMemcpyHostToDevice, stream_));
+      bind_decode_step(past_tokens, *current, *next);
+      CK(cudaEventRecord(step_begin_, stream_));
+      decoder_past_.context->enqueueV3(stream_);
+      CK(cudaEventRecord(step_end_, stream_));
+      CK(cudaMemcpyAsync(logits_host_, logits_past_, VOCAB * 4, cudaMemcpyDeviceToHost, stream_));
+      CK(cudaStreamSynchronize(stream_));
+      float step_ms;
+      CK(cudaEventElapsedTime(&step_ms, step_begin_, step_end_));
+      timing.decode_ms.push_back(step_ms);
+      next_token = argmax_host();
+      timing.tokens.push_back(next_token);
+      past_tokens++;
+      std::swap(current, next);
+    }
+  }
+
+  static void report(const Clip& clip, const ClipTiming& timing, std::ofstream& out) {
+    std::vector<float> sorted = timing.decode_ms;
+    std::sort(sorted.begin(), sorted.end());
+    float median = sorted.empty() ? 0 : sorted[sorted.size() / 2];
+    float p99 = sorted.empty() ? 0 : sorted[std::min(sorted.size() - 1, (size_t)(0.99 * sorted.size()))];
+    float ttft = timing.encoder_ms + timing.first_step_ms;
+    float gpu_total = ttft + std::accumulate(timing.decode_ms.begin(), timing.decode_ms.end(), 0.0f);
+    double rtf = timing.wall_ms / 1000.0 / clip.seconds;
+    long long t_start_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(timing.t_start.time_since_epoch()).count();
+    out << "{\"clip\":" << clip.id << ",\"t_start_ns\":" << t_start_ns << ",\"seconds\":" << clip.seconds
+        << ",\"encoder_ms\":" << timing.encoder_ms << ",\"first_step_ms\":" << timing.first_step_ms
+        << ",\"ttft_ms\":" << ttft << ",\"decode_ms_median\":" << median << ",\"decode_ms_p99\":" << p99
+        << ",\"decode_ms_max\":" << (sorted.empty() ? 0 : sorted.back())
+        << ",\"n_tokens\":" << timing.tokens.size() << ",\"gpu_total_ms\":" << gpu_total
+        << ",\"wall_ms\":" << timing.wall_ms << ",\"rtf_wall\":" << rtf << ",\"tokens\":[";
+    for (size_t i = 0; i < timing.tokens.size(); i++) out << (i ? "," : "") << timing.tokens[i];
+    out << "]}\n";
+    out.flush();
+    std::cout << "clip " << clip.id << " " << clip.seconds << "s enc " << timing.encoder_ms << " first "
+              << timing.first_step_ms << " dec med " << median << " p99 " << p99 << " tok "
+              << timing.tokens.size() << " wall " << timing.wall_ms << " ms RTF " << rtf << "\n";
+  }
+
+  static void pace_to_realtime(double clip_seconds, double wall_ms) {
+    double sleep_ms = clip_seconds * 1000.0 - wall_ms;
+    if (sleep_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds((long)sleep_ms));
+  }
+
+  bool realtime_;
+  Engine encoder_, decoder_first_, decoder_past_;
+  cudaStream_t stream_;
+  void* mel_ = nullptr;
+  void* hidden_ = nullptr;
+  void* ids_ = nullptr;
+  void* logits_first_ = nullptr;
+  void* logits_past_ = nullptr;
+  float* logits_host_ = nullptr;
+  KvBuffers encoder_kv_, self_kv_a_, self_kv_b_;
+  cudaEvent_t encoder_begin_, encoder_end_, first_step_end_, step_begin_, step_end_;
+};
+
+static std::vector<Clip> read_clip_list(const std::string& list_path) {
+  std::vector<Clip> clips;
+  std::ifstream file(list_path);
+  std::string line;
+  while (std::getline(file, line)) {
+    std::istringstream fields(line);
+    Clip clip;
+    fields >> clip.id >> clip.seconds >> clip.mel_path;
+    clips.push_back(clip);
+  }
+  return clips;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 5) {
+    std::cerr << "usage: engines_dir prec mel_list out.jsonl [repeats] [realtime]\n";
+    return 1;
+  }
+  std::string engines_dir = argv[1], precision = argv[2], list_path = argv[3], out_path = argv[4];
+  int repeats = argc > 5 ? atoi(argv[5]) : 3;
+  bool realtime = argc > 6 ? atoi(argv[6]) != 0 : false;
+  AsrPipeline pipeline(engines_dir, precision, realtime);
+  std::ofstream out(out_path);
+  std::vector<Clip> clips = read_clip_list(list_path);
+  pipeline.run_clip(clips[0], out, false);  // warm-up, twice
+  pipeline.run_clip(clips[0], out, false);
+  for (int repeat = 0; repeat < repeats; repeat++) {
+    for (const auto& clip : clips) pipeline.run_clip(clip, out, true);
+  }
+  std::cout << "DONE\n";
+  return 0;
 }

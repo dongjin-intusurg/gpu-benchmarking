@@ -1,52 +1,10 @@
 #!/usr/bin/env python3
 """Headless + exclusivity gate: refuse to measure on a box that is not solo.
 
-Every run number carries the regime "headless, solo-exclusive". an earlier unlocked run's
-numbers were taken with the desktop up (~392 MiB / 6 GPU clients on Jetson);
-this gate exists so that cannot happen silently again. It runs before every
-lock/measure stage and writes machine-readable evidence (preflight/v1) into
-provenance.
-
-Pre-declared gates (refusal = exit 2, driver scripts hard-stop):
-  R1 display stack up: systemd display-manager unit active, OR any compositor
-     process present (exact comm match against Xorg, Xwayland, gnome-shell,
-     kwin_wayland, weston). A compositor holds a GPU context and schedules
-     work at vsync - it contaminates both latency tails and idle bandwidth.
-  R2 foreign GPU clients: any compute (C) or graphics (G) process reported by
-     nvidia-smi. Solo-exclusive means OUR measurement process is the only
-     context; each offender is listed pid/name/MiB.
-  R3 zombie VRAM (discrete only): memory.used > 100 MiB with ZERO listed
-     clients means a crashed process leaked a context; its resident footprint
-     skews the VRAM budget and can hold clocks up. 100 MiB clears normal
-     driver/ECC reserved overhead.
-  R4 power mode (jetson only, --require-maxn): nvpmodel mode not MAXN, or
-     unverifiable while the flag is set. Without the flag this is WARN-only:
-     ceilings runs require MAXN (they define capacity), model timing runs
-     merely record the mode.
-
-Pre-declared warnings (recorded, never fatal):
-  W1 nvpmodel not MAXN / unverifiable (without --require-maxn).
-  W2 stale DISPLAY env var with no compositor running - harmless to the GPU
-     but a sign the shell came from a desktop session; GUI-launching tools
-     may hang.
-  W3 idle power: 10 s baseline mean > 1.5 x config idle_power_w_expected
-     (IDLE_POWER_WARN_FACTOR). Power is the corroborating witness on Tegra,
-     where an empty client list is NOT evidence of idleness (nvidia-smi on
-     Tegra reports no per-process memory - recorded as a quirk in the JSON).
-     Expected value null in config => SKIP, noted.
-
-Escape hatch: --allow-desktop downgrades every refusal to WARN and stamps
-smoke_only:true in the JSON - downstream stages must then mark their numbers
-invalid. For rehearsing the pipeline only, never for run numbers.
-
-Idle baseline: 10 s (--baseline-seconds) sampled through clock_sampler's
-make_sampler(), i.e. the SAME by-name source resolution the drift record
-uses - the baseline and the under-load samples are comparable by
-construction. Skipped (with a SKIP note) when refusing: a non-idle box has
-no idle baseline.
-
-Exit codes: 0 = proceed (PASS or WARN), 2 = refused. The JSON is written in
-every case. stdlib only.
+Runs before every lock/measure stage and writes preflight/v1 evidence (--out) in every case.
+Exit 0 = proceed (verdict PASS or WARN), 2 = REFUSED (refusals and remediation on stderr), 1 = bad
+config. Prints "preflight verdict: <verdict> -> <path>" last. --allow-desktop downgrades every
+refusal to WARN and stamps smoke_only:true - rehearsal only, downstream numbers are then invalid.
 """
 
 import argparse
@@ -58,20 +16,35 @@ import sys
 import time
 from pathlib import Path
 
-# clock_sampler lives beside this file; import it for the shared source
-# resolution helpers so baseline and drift samples come from identical sources
+# clock_sampler lives beside this file; its make_sampler() gives the idle baseline the SAME
+# by-name source resolution the under-load drift record uses, so the two are comparable.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import clock_sampler  # noqa: E402
 
+# Pre-declared gates (refusal) and warnings (recorded, never fatal):
+#   R1 a display manager unit or compositor process: a compositor holds a GPU context and
+#      schedules work at vsync, contaminating latency tails and idle bandwidth.
+#   R2 any compute/graphics client nvidia-smi reports: solo-exclusive means ours is the only context.
+#   R3 (discrete) memory.used > ZOMBIE_VRAM_MIB with zero clients: a leaked context skews the VRAM
+#      budget and can hold clocks up; 100 MiB clears normal driver/ECC reserved overhead.
+#   R4 (jetson, --require-maxn) nvpmodel not at the config's required_power_mode, or unverifiable.
+#   R5 (discrete, --require-maxn) enforced power limit off the default: a stale `nvidia-smi -pl`
+#      from a power sweep silently lowers every ceiling.
+#   W1 R4/R5 without --require-maxn: ceilings define capacity, model timing runs merely record.
+#   W2 stale DISPLAY with no compositor: harmless to the GPU, but GUI-launching tools may hang.
+#   W3 idle-power baseline mean > IDLE_POWER_WARN_FACTOR x config idle_power_w_expected. Power is
+#      the corroborating witness on Tegra, where nvidia-smi lists no per-process memory and an
+#      empty client list proves nothing.
 COMPOSITOR_NAMES = ['Xorg', 'Xwayland', 'gnome-shell', 'kwin_wayland', 'weston']
 ZOMBIE_VRAM_MIB = 100
 IDLE_POWER_WARN_FACTOR = 1.5
 BASELINE_SECONDS_DEFAULT = 10
+POWER_LIMIT_TOLERANCE_W = 1.0
 
 REMEDIATION_HEADLESS = """Remediation (go headless, then re-run this preflight):
   sudo systemctl isolate multi-user.target    # stops the display manager and every compositor
-  # ... run the run ...
-  sudo systemctl isolate graphical.target     # restores the desktop when the run is done"""
+  # ... run the stages ...
+  sudo systemctl isolate graphical.target     # restores the desktop when the stages are done"""
 
 REMEDIATION_CLIENTS = """Remediation (clear foreign GPU clients):
   kill or wait out the listed processes, then re-run this preflight
@@ -85,6 +58,13 @@ REMEDIATION_MAXN = """Remediation (power mode):
   sudo nvpmodel -p --verbose     # list modes, find the MAXN index
   sudo nvpmodel -m <MAXN index>  # ceilings define capacity - run them at the required mode"""
 
+TEGRA_CLIENT_QUIRK = ('tegra nvidia-smi reports no per-process memory - an empty '
+                      'client list is NOT evidence of idleness; corroborated by the '
+                      'idle-power baseline')
+
+# row shape: |  0  N/A  N/A   1234   G   /usr/lib/xorg/Xorg   392MiB |
+PROCESS_TABLE_ROW = re.compile(r'^\|\s+\d+\s+\S+\s+\S+\s+(\d+)\s+([A-Z+]+)\s+(.+?)\s+(\d+)MiB\s*\|')
+
 
 def say(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -93,15 +73,29 @@ def say(msg):
 def run_cmd(argv, timeout=15):
     """(returncode, stdout) - rc None if the binary is missing or timed out."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return result.returncode, result.stdout
     except (OSError, subprocess.TimeoutExpired):
         return None, ''
 
 
-# ---------------------------------------------------------------------------
-# Checks
-# ---------------------------------------------------------------------------
+def parse_float(text):
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+class Findings:
+    """Everything the gates accumulate; becomes the refusals/warnings/notes/checks of the JSON."""
+
+    def __init__(self):
+        self.refusals = []
+        self.warnings = []
+        self.notes = []
+        self.remediations = []
+        self.checks = {}
+
 
 def check_display_manager():
     rc, out = run_cmd(['systemctl', 'is-active', 'display-manager'])
@@ -115,11 +109,10 @@ def check_display_manager():
 def check_compositors():
     found = []
     for name in COMPOSITOR_NAMES:
-        # -x = exact comm match: avoids false hits on e.g. an editor whose
-        # command line happens to contain a compositor name
+        # -x = exact comm match: an editor whose command line mentions a compositor is not one
         rc, out = run_cmd(['pgrep', '-x', name])
         if rc == 0 and out.strip():
-            found.append({'name': name, 'pids': [int(p) for p in out.split()]})
+            found.append({'name': name, 'pids': [int(pid) for pid in out.split()]})
     return found
 
 
@@ -131,7 +124,7 @@ def query_compute_apps():
         return None
     apps = []
     for line in out.strip().splitlines():
-        parts = [p.strip() for p in line.split(',')]
+        parts = [part.strip() for part in line.split(',')]
         if len(parts) >= 3 and parts[0].isdigit():
             mib = int(parts[2]) if parts[2].isdigit() else None
             apps.append({'pid': int(parts[0]), 'name': parts[1], 'mib': mib, 'type': 'C'})
@@ -139,20 +132,17 @@ def query_compute_apps():
 
 
 def query_process_table():
-    """All rows of the plain nvidia-smi process table (covers G-type, which
-    has no csv query)."""
+    """All rows of the plain nvidia-smi process table (covers G-type, which has no csv query)."""
     rc, out = run_cmd(['nvidia-smi'])
     if rc != 0:
         return None
-    procs = []
-    # row shape: |  0  N/A  N/A   1234   G   /usr/lib/xorg/Xorg   392MiB |
-    row_re = re.compile(r'^\|\s+\d+\s+\S+\s+\S+\s+(\d+)\s+([A-Z+]+)\s+(.+?)\s+(\d+)MiB\s*\|')
+    processes = []
     for line in out.splitlines():
-        m = row_re.match(line)
-        if m:
-            procs.append({'pid': int(m.group(1)), 'type': m.group(2),
-                          'name': m.group(3).strip(), 'mib': int(m.group(4))})
-    return procs
+        match = PROCESS_TABLE_ROW.match(line)
+        if match:
+            processes.append({'pid': int(match.group(1)), 'type': match.group(2),
+                              'name': match.group(3).strip(), 'mib': int(match.group(4))})
+    return processes
 
 
 def query_memory_used_mib():
@@ -164,21 +154,15 @@ def query_memory_used_mib():
 
 
 def query_power_limit_w():
-    # enforced limit vs the card's default. A stale `nvidia-smi -pl <lower>` left
-    # over from a power sweep silently lowers every ceiling, so the discrete
-    # analogue of the jetson power-mode gate is: the enforced limit must equal
-    # the default (which on these cards is also the maximum).
     rc, out = run_cmd(['nvidia-smi',
                        '--query-gpu=power.limit,power.default_limit,power.max_limit',
                        '--format=csv,noheader,nounits'])
     if rc != 0 or not out.strip():
         return None
-    parts = [x.strip() for x in out.strip().splitlines()[0].split(',')]
-    def f(x):
-        try: return float(x)
-        except Exception: return None
-    return {'limit_w': f(parts[0]), 'default_w': f(parts[1]) if len(parts) > 1 else None,
-            'max_w': f(parts[2]) if len(parts) > 2 else None}
+    parts = [part.strip() for part in out.strip().splitlines()[0].split(',')]
+    return {'limit_w': parse_float(parts[0]),
+            'default_w': parse_float(parts[1]) if len(parts) > 1 else None,
+            'max_w': parse_float(parts[2]) if len(parts) > 2 else None}
 
 
 def check_nvpmodel():
@@ -200,41 +184,35 @@ def check_nvpmodel():
             'note': 'SKIP: nvpmodel query failed (may need interactive sudo)'}
 
 
-def measure_idle_baseline(cfg, seconds, notes):
+def measure_idle_baseline(config, seconds, notes):
     """Sample power/clocks for the window via clock_sampler's sources."""
-    sampler = clock_sampler.make_sampler(cfg)
+    sampler = clock_sampler.make_sampler(config)
     notes.extend(sampler.notes)
     header = sampler.header  # includes t_s at index 0; rows exclude it
     power_col = 'module_w' if 'module_w' in header else 'power_w'
     clock_col = 'gpu_mhz' if 'gpu_mhz' in header else 'sm_mhz'
-    p_idx = header.index(power_col) - 1
-    c_idx = header.index(clock_col) - 1
+    power_idx = header.index(power_col) - 1
+    clock_idx = header.index(clock_col) - 1
 
-    powers, clocks_mhz, n = [], [], 0
+    powers, clocks_mhz, samples = [], [], 0
     t0 = time.monotonic()
-    k = 0
     while time.monotonic() - t0 < seconds:
         row = sampler.row()
-        n += 1
-        try:
-            if row[p_idx]:
-                powers.append(float(row[p_idx]))
-        except (ValueError, IndexError):
-            pass
-        try:
-            if row[c_idx]:
-                clocks_mhz.append(float(row[c_idx]))
-        except (ValueError, IndexError):
-            pass
-        k += 1
-        delay = (t0 + k * sampler.period_s) - time.monotonic()
+        samples += 1
+        for idx, values in ((power_idx, powers), (clock_idx, clocks_mhz)):
+            try:
+                if row[idx]:
+                    values.append(float(row[idx]))
+            except (ValueError, IndexError):
+                pass
+        delay = (t0 + samples * sampler.period_s) - time.monotonic()
         if delay > 0:
             time.sleep(min(delay, sampler.period_s))
     sampler.close()
 
     baseline = {
         'seconds': seconds,
-        'samples': n,
+        'samples': samples,
         'backend': sampler.backend,
         'power_field': power_col,
         'power_w': None,
@@ -251,189 +229,215 @@ def measure_idle_baseline(cfg, seconds, notes):
     return baseline
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    ap = argparse.ArgumentParser(description='Headless + exclusivity preflight gate')
-    ap.add_argument('--device', required=True, help='device config JSON')
-    ap.add_argument('--out', required=True, help='output preflight.json')
-    ap.add_argument('--baseline-seconds', type=float, default=BASELINE_SECONDS_DEFAULT,
-                    help='idle baseline sampling window (default %(default)s)')
-    ap.add_argument('--require-maxn', action='store_true',
-                    help='refuse (not just warn) when nvpmodel is not the required mode - set for '
-                         'ceilings runs. The required mode is the device config\'s '
-                         'required_power_mode (default MAXN): a run that measures at a lower '
-                         'mode declares it there, and the ceilings it produces are that mode\'s '
-                         'capacity')
-    ap.add_argument('--allow-desktop', action='store_true',
-                    help='smoke tests only: downgrade refusals to warnings, stamp smoke_only')
-    args = ap.parse_args()
-
-    try:
-        cfg = clock_sampler.load_device_config(args.device)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f'FATAL: cannot read device config {args.device}: {e}', file=sys.stderr)
-        sys.exit(1)
-
-    platform = cfg.get('platform', 'discrete')
-    is_jetson = platform == 'jetson'
-    refusals, warnings, notes, remediations = [], [], [], []
-    checks = {}
-
-    say(f"preflight: {cfg.get('device_id', '?')} ({platform})"
-        + (' [allow-desktop: smoke only]' if args.allow_desktop else ''))
-
-    # --- R1: display stack ---------------------------------------------------
-    dm = check_display_manager()
+def gate_display_stack(findings):
+    """R1 + W2; returns the compositor list."""
+    display_manager = check_display_manager()
     compositors = check_compositors()
-    checks['display_manager'] = dm
-    checks['compositors'] = compositors
-    if 'note' in dm:
-        notes.append(dm['note'])
-    if dm['active']:
-        refusals.append('display-manager systemd unit is active - the box is not headless')
+    findings.checks['display_manager'] = display_manager
+    findings.checks['compositors'] = compositors
+    if 'note' in display_manager:
+        findings.notes.append(display_manager['note'])
+    if display_manager['active']:
+        findings.refusals.append('display-manager systemd unit is active - the box is not headless')
     if compositors:
         listing = ', '.join(f"{c['name']}(pid {','.join(map(str, c['pids']))})" for c in compositors)
-        refusals.append(f'compositor process(es) running: {listing}')
-    if (dm['active'] or compositors):
-        remediations.append(REMEDIATION_HEADLESS)
+        findings.refusals.append(f'compositor process(es) running: {listing}')
+    if display_manager['active'] or compositors:
+        findings.remediations.append(REMEDIATION_HEADLESS)
 
-    # --- W2: stale DISPLAY ---------------------------------------------------
     display_env = os.environ.get('DISPLAY', '')
-    checks['display_env'] = {'DISPLAY': display_env or None,
-                             'stale': bool(display_env) and not compositors}
+    findings.checks['display_env'] = {'DISPLAY': display_env or None,
+                                      'stale': bool(display_env) and not compositors}
     if display_env and not compositors:
-        warnings.append(f'DISPLAY={display_env} set but no compositor running - '
-                        'stale desktop-session environment')
+        findings.warnings.append(f'DISPLAY={display_env} set but no compositor running - '
+                                 'stale desktop-session environment')
+    return compositors
 
-    # --- R2: foreign GPU clients --------------------------------------------
+
+def gate_foreign_clients(findings, is_jetson):
+    """R2; returns the foreign client list."""
     compute_apps = query_compute_apps()
     table = query_process_table()
-    graphics = [p for p in (table or []) if 'G' in p['type']]
+    graphics = [proc for proc in (table or []) if 'G' in proc['type']]
     if compute_apps is None:
-        compute = [p for p in (table or []) if 'C' in p['type']]
-        notes.append('SKIP: --query-compute-apps unsupported here - compute clients taken '
-                     'from the plain nvidia-smi process table')
+        compute = [proc for proc in (table or []) if 'C' in proc['type']]
+        findings.notes.append('SKIP: --query-compute-apps unsupported here - compute clients taken '
+                              'from the plain nvidia-smi process table')
     else:
         compute = compute_apps
     clients = {'compute': compute, 'graphics': graphics}
     if is_jetson:
-        # Tegra quirk, recorded: nvidia-smi reports no per-process memory
-        # there, so an empty list proves nothing - the idle-power baseline
-        # below is the corroborating witness
-        clients['quirk'] = ('tegra nvidia-smi reports no per-process memory - an empty '
-                            'client list is NOT evidence of idleness; corroborated by the '
-                            'idle-power baseline')
-        notes.append(clients['quirk'])
-    checks['gpu_clients'] = clients
+        clients['quirk'] = TEGRA_CLIENT_QUIRK
+        findings.notes.append(TEGRA_CLIENT_QUIRK)
+    findings.checks['gpu_clients'] = clients
     foreign = compute + graphics
     if foreign:
-        for p in foreign:
-            mib = p.get('mib')
-            say(f"  foreign client: pid {p['pid']} {p.get('type', '?')} "
-                f"{p.get('name', '?')} {mib if mib is not None else '?'} MiB")
-        refusals.append(f'{len(foreign)} foreign GPU client(s) hold a context '
-                        '(listed above and in checks.gpu_clients)')
-        remediations.append(REMEDIATION_CLIENTS)
+        for proc in foreign:
+            mib = proc.get('mib')
+            say(f"  foreign client: pid {proc['pid']} {proc.get('type', '?')} "
+                f"{proc.get('name', '?')} {mib if mib is not None else '?'} MiB")
+        findings.refusals.append(f'{len(foreign)} foreign GPU client(s) hold a context '
+                                 '(listed above and in checks.gpu_clients)')
+        findings.remediations.append(REMEDIATION_CLIENTS)
+    return foreign
 
-    # --- R3: zombie VRAM (discrete only) ------------------------------------
-    if not is_jetson:
-        used = query_memory_used_mib()
-        checks['zombie_vram'] = {'memory_used_mib': used, 'threshold_mib': ZOMBIE_VRAM_MIB,
-                                 'clients_listed': len(foreign)}
-        if used is None:
-            notes.append('SKIP: memory.used query failed - zombie-VRAM check unavailable')
-        elif used > ZOMBIE_VRAM_MIB and not foreign:
-            refusals.append(f'{used} MiB VRAM resident with zero listed clients - '
-                            'leaked (zombie) GPU context')
-            remediations.append(REMEDIATION_ZOMBIE)
 
-    # --- R4/W1: power mode (jetson only) ------------------------------------
+def gate_zombie_vram(findings, foreign):
+    """R3 (discrete only)."""
+    used = query_memory_used_mib()
+    findings.checks['zombie_vram'] = {'memory_used_mib': used, 'threshold_mib': ZOMBIE_VRAM_MIB,
+                                      'clients_listed': len(foreign)}
+    if used is None:
+        findings.notes.append('SKIP: memory.used query failed - zombie-VRAM check unavailable')
+    elif used > ZOMBIE_VRAM_MIB and not foreign:
+        findings.refusals.append(f'{used} MiB VRAM resident with zero listed clients - '
+                                 'leaked (zombie) GPU context')
+        findings.remediations.append(REMEDIATION_ZOMBIE)
+
+
+def gate_power_mode(findings, config, require):
+    """R4 / W1 (jetson only)."""
+    power_mode = check_nvpmodel()
+    findings.checks['nvpmodel'] = power_mode
+    if 'note' in power_mode:
+        findings.notes.append(power_mode['note'])
+    want = (config.get('required_power_mode') or 'MAXN').strip()
+    power_mode['required_mode'] = want
+    have = power_mode['mode'] or ''
+    power_mode['at_required_mode'] = (want.upper() in have.upper()) if power_mode['mode'] else None
+    if power_mode['at_required_mode'] is True:
+        return
+    if require:
+        reason = (f"nvpmodel mode is '{power_mode['mode']}', not the required '{want}'"
+                  if power_mode['mode'] else 'nvpmodel mode is unverifiable')
+        findings.refusals.append(reason + ' (ceilings define capacity, so they must run at the '
+                                          'mode the run measures at)')
+        findings.remediations.append(REMEDIATION_MAXN.replace('MAXN index', f'{want} index')
+                                                     .replace('find the MAXN', f'find the {want}'))
+        return
+    findings.warnings.append(f"nvpmodel mode is '{power_mode['mode']}' (required mode is '{want}') - "
+                             'recorded; enforced only for ceilings runs')
+
+
+def gate_power_limit(findings, require):
+    """R5 / W1 (discrete only): the enforced limit must equal the default (= maximum on these cards)."""
+    power_limit = query_power_limit_w()
+    findings.checks['power_limit'] = power_limit
+    if not power_limit or power_limit.get('limit_w') is None or power_limit.get('default_w') is None:
+        findings.notes.append('SKIP: power-limit query failed - the discrete power-cap check is unavailable')
+        return
+    limit_w, default_w = power_limit['limit_w'], power_limit['default_w']
+    at_default = abs(limit_w - default_w) <= POWER_LIMIT_TOLERANCE_W
+    power_limit['at_default'] = at_default
+    if at_default:
+        return
+    if require:
+        findings.refusals.append(f"power limit is {limit_w:.0f} W, not the default "
+                                 f"{default_w:.0f} W (ceilings define capacity, so they must "
+                                 'run at the default power limit - a lower cap is a deliberate sweep)')
+        findings.remediations.append('Remediation (power limit):\n'
+                                     f"  sudo nvidia-smi -pl {default_w:.0f}   "
+                                     '# restore the default (= maximum) power limit')
+        return
+    findings.warnings.append(f"power limit is {limit_w:.0f} W (default {default_w:.0f} W) - "
+                             'recorded; enforced only for ceilings runs')
+
+
+def idle_baseline_with_check(findings, config, seconds):
+    """W3; returns (baseline block, idle power mean)."""
+    say(f'sampling {seconds:g} s idle baseline...')
+    baseline = measure_idle_baseline(config, seconds, findings.notes)
+    expected = config.get('idle_power_w_expected')
+    baseline['expected_power_w'] = expected
+    if baseline['power_w'] is None:
+        return baseline, None
+    power_mean = baseline['power_w']['mean']
+    if expected is None:
+        findings.notes.append('SKIP: idle_power_w_expected is null in the device config - '
+                              'power-vs-expected check not applicable')
+    elif power_mean > IDLE_POWER_WARN_FACTOR * expected:
+        findings.warnings.append(
+            f'idle power mean {power_mean} W exceeds '
+            f'{IDLE_POWER_WARN_FACTOR} x expected {expected} W - '
+            'something is exercising the GPU or the platform is not settled')
+    return baseline, power_mean
+
+
+def print_refusal(findings, out_path):
+    print('FATAL: preflight REFUSED - the box is not in the measurement regime:',
+          file=sys.stderr, flush=True)
+    for refusal in findings.refusals:
+        print(f'  - {refusal}', file=sys.stderr, flush=True)
+    seen = set()
+    for remediation in findings.remediations:
+        if remediation not in seen:
+            seen.add(remediation)
+            print(remediation, file=sys.stderr, flush=True)
+    say(f'preflight verdict: REFUSED -> {out_path}')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Headless + exclusivity preflight gate')
+    parser.add_argument('--device', required=True, help='device config JSON')
+    parser.add_argument('--out', required=True, help='output preflight.json')
+    parser.add_argument('--baseline-seconds', type=float, default=BASELINE_SECONDS_DEFAULT,
+                        help='idle baseline sampling window (default %(default)s)')
+    parser.add_argument('--require-maxn', action='store_true',
+                        help='refuse (not just warn) when nvpmodel is not the required mode - set for '
+                             'ceilings runs. The required mode is the device config\'s '
+                             'required_power_mode (default MAXN): a run that measures at a lower '
+                             'mode declares it there, and the ceilings it produces are that mode\'s '
+                             'capacity')
+    parser.add_argument('--allow-desktop', action='store_true',
+                        help='smoke tests only: downgrade refusals to warnings, stamp smoke_only')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    try:
+        config = clock_sampler.load_device_config(args.device)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f'FATAL: cannot read device config {args.device}: {error}', file=sys.stderr)
+        sys.exit(1)
+
+    platform = config.get('platform', 'discrete')
+    is_jetson = platform == 'jetson'
+    findings = Findings()
+
+    say(f"preflight: {config.get('device_id', '?')} ({platform})"
+        + (' [allow-desktop: smoke only]' if args.allow_desktop else ''))
+
+    gate_display_stack(findings)
+    foreign = gate_foreign_clients(findings, is_jetson)
     if is_jetson:
-        pm = check_nvpmodel()
-        checks['nvpmodel'] = pm
-        if 'note' in pm:
-            notes.append(pm['note'])
-        want = (cfg.get('required_power_mode') or 'MAXN').strip()
-        pm['required_mode'] = want
-        have = (pm['mode'] or '')
-        pm['at_required_mode'] = (want.upper() in have.upper()) if pm['mode'] else None
-        if pm['at_required_mode'] is True:
-            pass
-        elif args.require_maxn:
-            reason = (f"nvpmodel mode is '{pm['mode']}', not the required '{want}'"
-                      if pm['mode'] else 'nvpmodel mode is unverifiable')
-            refusals.append(reason + ' (ceilings define capacity, so they must run at the '
-                                     'mode the run measures at)')
-            remediations.append(REMEDIATION_MAXN.replace('MAXN index', f'{want} index')
-                                                .replace('find the MAXN', f'find the {want}'))
-        else:
-            warnings.append(f"nvpmodel mode is '{pm['mode']}' (required mode is '{want}') - "
-                            'recorded; enforced only for ceilings runs')
+        gate_power_mode(findings, config, args.require_maxn)
+    else:
+        gate_zombie_vram(findings, foreign)
+        gate_power_limit(findings, args.require_maxn)
 
-    # --- R5/W2: power limit (discrete only) ---------------------------------
-    if not is_jetson:
-        pl = query_power_limit_w()
-        checks['power_limit'] = pl
-        if not pl or pl.get('limit_w') is None or pl.get('default_w') is None:
-            notes.append('SKIP: power-limit query failed - the discrete power-cap check is unavailable')
-        else:
-            at_default = abs(pl['limit_w'] - pl['default_w']) <= 1.0
-            pl['at_default'] = at_default
-            if at_default:
-                pass
-            elif args.require_maxn:
-                refusals.append(f"power limit is {pl['limit_w']:.0f} W, not the default "
-                                f"{pl['default_w']:.0f} W (ceilings define capacity, so they must "
-                                'run at the default power limit - a lower cap is a deliberate sweep)')
-                remediations.append('Remediation (power limit):\n'
-                                    f"  sudo nvidia-smi -pl {pl['default_w']:.0f}   "
-                                    '# restore the default (= maximum) power limit')
-            else:
-                warnings.append(f"power limit is {pl['limit_w']:.0f} W (default {pl['default_w']:.0f} W) - "
-                                'recorded; enforced only for ceilings runs')
-
-    # --- allow-desktop downgrade ---------------------------------------------
     smoke_only = False
-    if refusals and args.allow_desktop:
+    if findings.refusals and args.allow_desktop:
         smoke_only = True
-        warnings.extend(f'(smoke-only downgrade) {r}' for r in refusals)
-        refusals = []
+        findings.warnings.extend(f'(smoke-only downgrade) {refusal}' for refusal in findings.refusals)
+        findings.refusals = []
         say('WARN: refusal conditions present but --allow-desktop set - '
             'proceeding as SMOKE RUN; downstream numbers are invalid')
+    refused = bool(findings.refusals)
 
-    refused = bool(refusals)
-
-    # --- idle baseline (skipped on refusal: a non-idle box has no baseline) --
-    idle_baseline = None
-    idle_power_mean = None
+    # a non-idle box has no idle baseline
+    idle_baseline, idle_power_mean = None, None
     if refused:
-        notes.append('SKIP: idle baseline not measured - preflight refused before baseline')
+        findings.notes.append('SKIP: idle baseline not measured - preflight refused before baseline')
     else:
-        say(f'sampling {args.baseline_seconds:g} s idle baseline...')
-        idle_baseline = measure_idle_baseline(cfg, args.baseline_seconds, notes)
-        expected = cfg.get('idle_power_w_expected')
-        idle_baseline['expected_power_w'] = expected
-        if idle_baseline['power_w'] is not None:
-            idle_power_mean = idle_baseline['power_w']['mean']
-            if expected is None:
-                notes.append('SKIP: idle_power_w_expected is null in the device config - '
-                             'power-vs-expected check not applicable')
-            elif idle_power_mean > IDLE_POWER_WARN_FACTOR * expected:
-                warnings.append(
-                    f'idle power mean {idle_power_mean} W exceeds '
-                    f'{IDLE_POWER_WARN_FACTOR} x expected {expected} W - '
-                    'something is exercising the GPU or the platform is not settled')
+        idle_baseline, idle_power_mean = idle_baseline_with_check(findings, config, args.baseline_seconds)
 
-    verdict = 'REFUSED' if refused else ('WARN' if warnings else 'PASS')
-
+    verdict = 'REFUSED' if refused else ('WARN' if findings.warnings else 'PASS')
     result = {
         'schema': 'preflight/v1',
         'run_date': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-        'device_tag': cfg.get('device_tag'),
-        'device_id': cfg.get('device_id'),
+        'device_tag': config.get('device_tag'),
+        'device_id': config.get('device_id'),
         'platform': platform,
         'device_config': os.path.abspath(args.device),
         'require_maxn': args.require_maxn,
@@ -441,31 +445,22 @@ def main():
         'verdict': verdict,
         'smoke_only': smoke_only,
         'idle_power_w_mean': idle_power_mean,
-        'refusals': refusals,
-        'warnings': warnings,
-        'notes': notes,
-        'checks': checks,
+        'refusals': findings.refusals,
+        'warnings': findings.warnings,
+        'notes': findings.notes,
+        'checks': findings.checks,
         'idle_baseline': idle_baseline,
     }
     out_path = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    with open(out_path, 'w') as f:
-        json.dump(result, f, indent=1)
+    with open(out_path, 'w') as handle:
+        json.dump(result, handle, indent=1)
 
-    for w in warnings:
-        say(f'WARN: {w}')
+    for warning in findings.warnings:
+        say(f'WARN: {warning}')
 
     if refused:
-        print('FATAL: preflight REFUSED - the box is not in the measurement regime:',
-              file=sys.stderr, flush=True)
-        for r in refusals:
-            print(f'  - {r}', file=sys.stderr, flush=True)
-        seen = set()
-        for rem in remediations:
-            if rem not in seen:
-                seen.add(rem)
-                print(rem, file=sys.stderr, flush=True)
-        say(f'preflight verdict: REFUSED -> {out_path}')
+        print_refusal(findings, out_path)
         sys.exit(2)
 
     say(f'preflight verdict: {verdict}'
