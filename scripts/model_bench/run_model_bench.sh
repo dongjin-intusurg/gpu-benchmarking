@@ -120,6 +120,10 @@ cleanup_clocks() {
   fi
   CLOCKS_LOCKED=0
   [ -n "$KEEPALIVE_PID" ] && { kill "$KEEPALIVE_PID" 2>/dev/null || true; KEEPALIVE_PID=""; }
+  # An EXIT trap hands its own status to the shell. start_sudo_keepalive runs only
+  # on the jetson branch, so on discrete KEEPALIVE_PID is empty, the test above is
+  # the last command, and a completely successful run exited 1.
+  return 0
 }
 trap cleanup_clocks EXIT INT TERM
 
