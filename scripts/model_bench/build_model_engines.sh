@@ -181,8 +181,8 @@ if [ "$SKIP_BUILD" = 0 ]; then
   build_engine "$REF" "" "$REF_LOG" || die "fp32 reference build failed — see $REF_LOG
 The accuracy gate requires an fp32 TensorRT reference built on-device from the
 same ONNX. If this device genuinely cannot build it (e.g. a plugin without an
-fp32 path), supply a known-good fp32 engine yourself:
-  python3 $KIT_DIR/model_bench/run_accuracy_gate.py <acc_manifest> --reference <fp32.engine> ...
+fp32 path), supply a known-good fp32 engine yourself when running the gate
+(--reference <fp32.engine>; the gate runner is not shipped in this kit yet).
 An operator-supplied reference is recorded as such in accuracy.json — there is
 no silent precision fallback."
   fi

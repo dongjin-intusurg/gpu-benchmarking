@@ -172,7 +172,9 @@ MODEL_DEADLINE_MS=100
 ## 3. `configs/manifests/acc_manifest_<name>.json`
 
 Tensor-level truth for the accuracy gate. This is the part that cannot be
-guessed — it needs the model's real I/O spec.
+guessed — it needs the model's real I/O spec. Note: the gate runner is not
+shipped in this kit yet — stage 4 validates that `ACC_MANIFEST` exists and
+records it with the row; the numbers below are not judged here.
 
 | Field | Meaning |
 |---|---|

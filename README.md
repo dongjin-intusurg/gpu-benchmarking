@@ -70,7 +70,9 @@ a 2-minute rehearsal.
      calibration cache / plugins / shapes if the model has them — always through
      `${MODEL_ROOT}`;
    - write `configs/manifests/acc_manifest_<name>.json` (which outputs the
-     accuracy gate compares, where the sample inputs are);
+     accuracy gate compares, where the sample inputs are) - the gate runner
+     itself is not part of this kit yet: `ACC_MANIFEST` is validated and
+     recorded with the row, nothing is judged from it here;
    - choose **how it is built** with `MODEL_BUILDERS` (§2b):
      `trt` — a TensorRT engine from the ONNX (default);
      `adopt` — an engine you already built (`MODEL_ENGINE`);
