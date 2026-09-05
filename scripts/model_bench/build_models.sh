@@ -76,7 +76,7 @@ print(json.dumps(d))
 PY
 }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
-fsize(){ stat -c %s "$1" 2>/dev/null || echo 0; }
+fsize(){ stat -L -c %s "$1" 2>/dev/null || echo 0; }   # -L: an adopted or pre-existing engine may be a symlink
 # the run-time trtexec string for an engine row: plugins + shapes + extra (+ member flags)
 run_flags(){
   local f=""
