@@ -340,6 +340,15 @@ build_trtllm(){
 #-----------------------------------------------------------------------------
 # per model: every builder, in registration order; fallback per the rules
 #-----------------------------------------------------------------------------
+# a registry row whose manifest is gone would still be measured: on a full build
+# (no --only) drop the rows of models that no manifest registers any more
+if [ "$LIST" != 1 ] && [ ${#ONLY[@]} -eq 0 ] && [ -d "$ROWS_DIR" ]; then
+  for f in "$ROWS_DIR"/*.jsonl; do
+    [ -e "$f" ] || continue
+    m=$(basename "$f" .jsonl)
+    in_list "$m" $NAMES || { rm -f "$f"; say "stale registry row removed: $m (no manifest registers it)"; }
+  done
+fi
 n_ok=0; n_fail=0; FAILED=()
 for name in $NAMES; do
   eval "$(registry_export "$name")"
