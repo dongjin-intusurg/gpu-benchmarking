@@ -340,14 +340,14 @@ stage3_models() {
       # the same pass also saved as a report for the NCU GUI / ncu --import
       # (<out>/ncu_reports/<model>.ncu-rep); -f overwrites a previous one
       NCU_ARGS+=(--export "$OUT_DIR/ncu_reports/$NAME")
-      if [ "${NCU_FULL:-0}" = 1 ]; then
-        NCU_ARGS+=(--set full)
-      else
-        # dram__bytes is n/a on Jetson iGPUs (no FB counters); lts__t_bytes (L2<->
-        # memory-side bytes from the SM view) is the byte proxy there — request
-        # both, unsupported ones read n/a and the parser takes what's populated
-        NCU_ARGS+=(--metrics dram__bytes.sum,lts__t_bytes.sum,lts__t_sectors_lookup_miss.sum,lts__t_sectors_op_read.sum,lts__t_sectors_op_write.sum,gpu__time_duration.sum,sm__inst_executed_pipe_tensor.sum,sm__sass_thread_inst_executed_op_ffma_pred_on.sum,sm__sass_thread_inst_executed_op_fadd_pred_on.sum,sm__sass_thread_inst_executed_op_fmul_pred_on.sum,sm__sass_thread_inst_executed_op_hfma_pred_on.sum,sm__sass_thread_inst_executed_op_hadd_pred_on.sum,sm__sass_thread_inst_executed_op_hmul_pred_on.sum)
-      fi
+      # NCU_FULL=1 adds every section to the exported report; the counter list
+      # below stays on the command line either way - the CSV parser reads these
+      # metrics by their raw names, which a section set alone does not print
+      [ "${NCU_FULL:-0}" = 1 ] && NCU_ARGS+=(--set full)
+      # dram__bytes is n/a on Jetson iGPUs (no FB counters); lts__t_bytes (L2<->
+      # memory-side bytes from the SM view) is the byte proxy there — request
+      # both, unsupported ones read n/a and the parser takes what's populated
+      NCU_ARGS+=(--metrics dram__bytes.sum,lts__t_bytes.sum,lts__t_sectors_lookup_miss.sum,lts__t_sectors_op_read.sum,lts__t_sectors_op_write.sum,gpu__time_duration.sum,sm__inst_executed_pipe_tensor.sum,sm__sass_thread_inst_executed_op_ffma_pred_on.sum,sm__sass_thread_inst_executed_op_fadd_pred_on.sum,sm__sass_thread_inst_executed_op_fmul_pred_on.sum,sm__sass_thread_inst_executed_op_hfma_pred_on.sum,sm__sass_thread_inst_executed_op_hadd_pred_on.sum,sm__sass_thread_inst_executed_op_hmul_pred_on.sum)
       # sudo resets PATH (secure_path): resolve both binaries to absolute paths
       NCU_BIN=$(command -v ncu); TRTEXEC_BIN=$(command -v trtexec)
       # sudo resets the environment: LD_LIBRARY_PATH must be re-passed or the
