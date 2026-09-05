@@ -184,22 +184,38 @@ build_trt(){ # $1 builder_requested
 #-----------------------------------------------------------------------------
 # adopt: a repo-built engine; we link it, load-gate it, and say so in the row
 #-----------------------------------------------------------------------------
-build_adopt(){
-  local p="$R_PRIMARY_PRECISION" src="$R_ENGINE"
-  local link="$R_ENGINE_DIR/${R_NAME}_${p}.engine"
-  say "  [adopt] $R_NAME  <- $src"
+#   $1 row name  $2 flat link name (without _<prec>.engine)  $3 engine
+#   $4 arch_gflops  $5 extra member run flags
+adopt_one(){
+  local row=$1 base=$2 src=$3 agf=$4 mflags=${5:-} p="$R_PRIMARY_PRECISION"
+  local link="$R_ENGINE_DIR/${base}_${p}.engine"
+  say "  [adopt] $row  <- $src"
   [ -f "$src" ] || { say "  [adopt] engine missing: $src"; return 1; }
   ln -sfn "$src" "$link"
   local prof="${src%.engine}_profile.json"
   [ -f "$prof" ] && ln -sfn "$prof" "${link%.engine}_profile.json"
-  local log="$BUILD_LOG_DIR/${R_NAME}_adopt.log" rf; rf=$(run_flags)
+  local log="$BUILD_LOG_DIR/${row}_adopt.log" rf; rf=$(run_flags "$mflags")
   if ! python3 "$MB_DIR/validate_engines.py" "$link" --precision "$p" ${rf:+--extra="$rf"} > "$log" 2>&1; then
-    tail -12 "$log"; say "  [adopt] $R_NAME failed the load gate - see $log"; return 1
+    tail -12 "$log"; say "  [adopt] $row failed the load gate - see $log"; return 1
   fi
-  jrow row="$R_NAME" model="$R_NAME" kind=engine engine="$link" precision="$p" \
+  jrow row="$row" model="$R_NAME" kind=engine engine="$link" precision="$p" \
        builder_requested=adopt builder_used=adopt adopted=true source_engine="$src" \
-       run_flags="$rf" hz="$R_HZ" deadline_ms="$R_DEADLINE_MS" arch_gflops="${R_ARCH_GFLOPS:-0}" \
+       run_flags="$rf" hz="$R_HZ" deadline_ms="$R_DEADLINE_MS" arch_gflops="${agf:-0}" \
        engine_bytes="$(fsize "$src")" stamp="adopted sha256=$(sha "$src")" built_at="$STAMP_DATE" trt="$TRT_VER"
+}
+build_adopt(){
+  if [ -z "$R_MEMBERS" ]; then
+    adopt_one "$R_NAME" "$R_NAME" "$R_ENGINE" "${R_ARCH_GFLOPS:-0}"
+  else
+    # an engine set built outside the kit (MODEL_ENGINE_<member>): one adopted
+    # engine per member, linked as <member>_<prec>.engine - the layout an e2e
+    # driver opens - and one row each, as the trt builder does for its members
+    local m v src agf rflags
+    for m in $R_MEMBERS; do
+      v="R_ENGINE_$m"; src="${!v:-}"; v="R_ARCH_GFLOPS_$m"; agf="${!v:-}"; v="R_RUN_FLAGS_$m"; rflags="${!v:-}"
+      adopt_one "${R_NAME}_$m" "$m" "$src" "${agf:-0}" "$rflags" || return 1
+    done
+  fi
 }
 
 #-----------------------------------------------------------------------------
