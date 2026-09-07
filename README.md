@@ -396,6 +396,11 @@ sudo -v                                  # the measure step pins the clocks; it 
 ./scripts/run_model_solo.sh --list       # what is registered and what it would build — no GPU
 ./scripts/run_model_solo.sh              # validate -> build -> measure -> N, every registered model
 ./scripts/run_model_solo.sh --only <m>   # one model (repeatable);  --skip-build: artifacts exist
+NCU_FULL=1 ./scripts/run_model_solo.sh   # the NCU pass keeps its counter list and adds every section to
+                                          # engine_rows/ncu_reports/<row>.ncu-rep (5-8x slower; the extra
+                                          # replays warm L2, so read DRAM bytes from the default pass)
+NCU_GENERATIVE=1 ./scripts/run_model_solo.sh  # discrete only: also profile ONE chunk step of every
+                                          # TensorRT-LLM rung (minutes to hours per rung) into the same dir
 ```
 
 **One stage, every runtime — every registered model gets a solo measurement

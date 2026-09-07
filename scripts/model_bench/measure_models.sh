@@ -313,6 +313,22 @@ PYSNAP
         [ $rc -eq 0 ] || { tail -10 "$D/sweep.log" | tee -a "$LOG"; say "  $ROW: sweep failed - $D/sweep.log"; continue; }
         python3 "$MR" trtllm --row "$D/row.json" --sweep "$D/sweep_${ROW}_locked.json" --vram "$D/vram.json" --drift "$D/drift.json" --out "$D/rows.json" 2>&1 | tee -a "$LOG" \
           && NONENGINE_JSONS+=("$D/rows.json")
+        # NCU_GENERATIVE=1: the counter pass the engine rows get, for one chunk step of this rung
+        # (ncu_step.py brackets the step; NCU_FULL=1 adds the full section set) ->
+        # <run>/engine_rows/ncu_reports/<row>.ncu-rep + <row dir>/ncu_kernels.csv. Slow: minutes to hours per rung.
+        if [ "${NCU_GENERATIVE:-0}" = 1 ] && command -v ncu >/dev/null; then
+          NSTEP="$KIT/model_bench/trtllm/ncu_step.py"; NREP="$OUT/engine_rows/ncu_reports"; mkdir -p "$NREP"
+          NCU_ARGS=(--profile-from-start off --csv --target-processes all -f --cache-control none --export "$NREP/$ROW" --log-file "$D/ncu_kernels.csv")
+          [ "${NCU_FULL:-0}" = 1 ] && NCU_ARGS+=(--set full)
+          NCU_ARGS+=(--metrics dram__bytes.sum,lts__t_bytes.sum,lts__t_sectors_lookup_miss.sum,lts__t_sectors_op_read.sum,lts__t_sectors_op_write.sum,gpu__time_duration.sum,sm__inst_executed_pipe_tensor.sum)
+          say "  ncu step pass for $ROW (one chunk-$CHUNK step under Nsight; this is the slow step)..."
+          sudo PATH="$PATH" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" OPAL_PREFIX="${OPAL_PREFIX:-}" HF_HOME="${HF_HOME:-}" HOME="$HOME" \
+               TLLM_WORKER_USE_SINGLE_PROCESS=1 "$(command -v ncu)" "${NCU_ARGS[@]}" \
+               "$TRT_PY" "$NSTEP" --tool-dir "$(dirname "$STEP")" --model "$SERVING_DIR" --image "$IMAGE" --chunk "$CHUNK" > "$D/ncu.log" 2>&1 \
+            || say "WARN: ncu step pass failed for $ROW - see $D/ncu.log"
+          [ -s "$NREP/$ROW.ncu-rep" ] && sudo "$(command -v ncu)" --import "$NREP/$ROW.ncu-rep" --csv --page details --print-units base \
+            --log-file "$D/ncu_kernels.csv" >/dev/null 2>&1
+        fi
         ;;
       *) die "$ROW: unknown runtime '$RUNTIME'" ;;
     esac
