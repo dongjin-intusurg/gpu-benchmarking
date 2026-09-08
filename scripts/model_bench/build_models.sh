@@ -100,19 +100,22 @@ build_trt_one(){
   local bdir="$R_ENGINE_DIR/build/${row}" man="$R_ENGINE_DIR/build/manifest_${row}.env"
   mkdir -p "$R_ENGINE_DIR/build"
   # a synthesized single-engine manifest: the existing builder's contract
+  # %q shell-quotes every value: a flag string with spaces (a min/opt/max shape
+  # profile from an @file) is one assignment when the manifest is sourced, not
+  # an assignment followed by a command
   {
-    echo "MODEL_NAME=$base"
-    echo "MODEL_ONNX=$onnx"
-    echo "MODEL_PRECISION=$prec"
-    echo "MODEL_HZ=$R_HZ"
-    echo "MODEL_DEADLINE_MS=$R_DEADLINE_MS"
-    [ "$prec" = int8 ] && echo "MODEL_CALIB_CACHE=$R_CALIB_CACHE"
-    echo "MODEL_PLUGINS=$R_PLUGINS"
-    echo "MODEL_SHAPES=$shapes"
-    echo "MODEL_EXTRA_ARGS=$R_EXTRA_ARGS"
-    echo "MODEL_BUILD_ARGS=$bargs"
-    echo "ACC_MANIFEST=$R_ACC_MANIFEST"
-    echo "MODEL_ARCH_GFLOPS=$agf"
+    printf 'MODEL_NAME=%q\n' "$base"
+    printf 'MODEL_ONNX=%q\n' "$onnx"
+    printf 'MODEL_PRECISION=%q\n' "$prec"
+    printf 'MODEL_HZ=%q\n' "$R_HZ"
+    printf 'MODEL_DEADLINE_MS=%q\n' "$R_DEADLINE_MS"
+    [ "$prec" = int8 ] && printf 'MODEL_CALIB_CACHE=%q\n' "$R_CALIB_CACHE"
+    printf 'MODEL_PLUGINS=%q\n' "$R_PLUGINS"
+    printf 'MODEL_SHAPES=%q\n' "$shapes"
+    printf 'MODEL_EXTRA_ARGS=%q\n' "$R_EXTRA_ARGS"
+    printf 'MODEL_BUILD_ARGS=%q\n' "$bargs"
+    printf 'ACC_MANIFEST=%q\n' "$R_ACC_MANIFEST"
+    printf 'MODEL_ARCH_GFLOPS=%q\n' "$agf"
   } > "$man"
   local log="$BUILD_LOG_DIR/${row}.log" skip=0
   [ "$primary" = 1 ] || skip=1
